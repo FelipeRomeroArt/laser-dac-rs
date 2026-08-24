@@ -98,3 +98,14 @@ impl<T: rusb::UsbContext> UsbEndpoints for rusb::DeviceHandle<T> {
         rusb::DeviceHandle::release_interface(self, iface)
     }
 }
+
+/// Whether a raw `rusb` error means the USB device is gone (fatal,
+/// unrecoverable without reconnection) rather than transient. Shared by the
+/// Helios and LaserCube USB backends so their fatal-error classification
+/// cannot drift apart.
+pub(crate) fn is_fatal_rusb(e: &rusb::Error) -> bool {
+    matches!(
+        e,
+        rusb::Error::NoDevice | rusb::Error::Io | rusb::Error::Pipe
+    )
+}

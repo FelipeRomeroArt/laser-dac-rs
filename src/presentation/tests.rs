@@ -1491,6 +1491,40 @@ fn frame_session_keeps_default_target_buffer_for_other_fifo_backends() {
     );
 }
 
+#[test]
+fn for_backend_accepts_matching_model_and_source_kind() {
+    let fifo = crate::backend::BackendKind::Fifo(Box::new(FifoTestBackend::new()));
+    assert!(super::output_model::for_backend(&fifo, false).is_ok());
+
+    let swap = crate::backend::BackendKind::FrameSwap(Box::new(FrameSwapTestBackend::new()));
+    assert!(super::output_model::for_backend(&swap, true).is_ok());
+}
+
+#[test]
+fn for_backend_rejects_mismatched_model_and_source_kind() {
+    // A FIFO output model cannot be driven from a frame content source.
+    let fifo = crate::backend::BackendKind::Fifo(Box::new(FifoTestBackend::new()));
+    let err = match super::output_model::for_backend(&fifo, true) {
+        Err(e) => e,
+        Ok(_) => panic!("FIFO model must reject a frame source"),
+    };
+    assert!(
+        err.to_string().contains("FIFO"),
+        "unexpected message: {err}"
+    );
+
+    // A frame-swap output model cannot be driven from a FIFO content source.
+    let swap = crate::backend::BackendKind::FrameSwap(Box::new(FrameSwapTestBackend::new()));
+    let err = match super::output_model::for_backend(&swap, false) {
+        Err(e) => e,
+        Ok(_) => panic!("frame-swap model must reject a FIFO source"),
+    };
+    assert!(
+        err.to_string().contains("frame"),
+        "unexpected message: {err}"
+    );
+}
+
 /// Minimal FrameSwap test backend.
 struct FrameSwapTestBackend {
     connected: bool,

@@ -8,6 +8,7 @@ use crate::protocols::helios::{
     bulk_transfer_timeout, encode_frame_into, DeviceStatus, HeliosDac, HeliosDacController,
     HeliosDacError, Point as HeliosPoint, WriteFrameFlags,
 };
+use crate::protocols::usb_transfer::is_fatal_rusb;
 
 const STATUS_ERROR_LIMIT: u32 = 50;
 
@@ -97,10 +98,7 @@ impl HeliosBackend {
     /// Returns `true` if the given Helios error indicates the USB device was
     /// physically disconnected (fatal, unrecoverable without reconnection).
     fn is_fatal_usb_error(e: &HeliosDacError) -> bool {
-        matches!(
-            e,
-            HeliosDacError::UsbError(rusb::Error::NoDevice | rusb::Error::Io | rusb::Error::Pipe)
-        )
+        matches!(e, HeliosDacError::UsbError(inner) if is_fatal_rusb(inner))
     }
 
     /// Returns `true` if the error is a USB access-permission failure — on Linux

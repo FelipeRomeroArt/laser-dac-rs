@@ -7,7 +7,7 @@ use crate::backend::{BackendKind, WriteOutcome};
 use crate::device::DacInfo;
 use crate::error::Error;
 
-use super::super::content_source::{ContentSourceKind, FifoContentSource};
+use super::super::content_source::ContentSourceKind;
 use super::{
     blank_and_close_shutter, estimator_fullness, process_control_messages, LoopCtx,
     OutputModelAdapter, StepOutcome,
@@ -24,18 +24,6 @@ const MIN_WRITE_QUANTUM_FLOOR: usize = 16;
 /// Continuous `WouldBlock` for longer than this is treated as a stalled/dead
 /// link so reconnect engages instead of spinning forever.
 const WOULDBLOCK_STALL_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Re-borrow the loop-context source as a `FifoContentSource`. NetworkFifo is
-/// only ever paired with a Fifo source by the driver; mismatch is a programmer
-/// error.
-fn fifo_source<'a>(source: &'a mut ContentSourceKind<'_>) -> &'a mut dyn FifoContentSource {
-    match source {
-        ContentSourceKind::Fifo(s) => &mut **s,
-        ContentSourceKind::Frame(_) => {
-            unreachable!("NetworkFifoAdapter requires a Fifo content source")
-        }
-    }
-}
 
 pub(crate) struct NetworkFifoAdapter {
     max_points: usize,
@@ -92,9 +80,17 @@ impl OutputModelAdapter for NetworkFifoAdapter {
             return StepOutcome::Continue;
         }
 
-        let n = fifo_source(&mut ctx.source)
-            .produce_chunk(target_points, pps, ctx.is_armed)
-            .len();
+        // The adapter/source pairing is validated once at construction
+        // (`for_backend`); this guard keeps any future wiring mistake a
+        // reported error instead of a panic.
+        let source = match &mut ctx.source {
+            ContentSourceKind::Fifo(s) => s,
+            ContentSourceKind::Frame(_) => {
+                return super::source_mismatch(ctx, "NetworkFifoAdapter");
+            }
+        };
+
+        let n = source.produce_chunk(target_points, pps, ctx.is_armed).len();
         if n == 0 {
             ctx.sleep_and_mark_activity(Duration::from_millis(1));
             return StepOutcome::Continue;
@@ -103,14 +99,14 @@ impl OutputModelAdapter for NetworkFifoAdapter {
         // Inner WouldBlock spin: ~100µs hardware drain assumption.
         let spin_start = Instant::now();
         loop {
-            let outcome = match fifo_source(&mut ctx.source).cached_slice() {
+            let outcome = match source.cached_slice() {
                 Some(slice) => ctx.backend.try_write(pps, slice),
                 None => return StepOutcome::Continue,
             };
             match outcome {
                 Ok(WriteOutcome::Written) => {
                     ctx.metrics.mark_write_success();
-                    fifo_source(&mut ctx.source).commit_written(n, ctx.is_armed);
+                    source.commit_written(n, ctx.is_armed);
                     break;
                 }
                 Ok(WriteOutcome::WouldBlock) => {
@@ -136,7 +132,11 @@ impl OutputModelAdapter for NetworkFifoAdapter {
                         ));
                         return StepOutcome::Disconnected;
                     }
-                    ctx.sleep_and_mark_activity(Duration::from_micros(100));
+                    // Inlined `sleep_and_mark_activity`: `source` is still
+                    // borrowed from `ctx.source` for the next spin iteration,
+                    // so only field-disjoint accesses are allowed here.
+                    ctx.clock.sleep(Duration::from_micros(100));
+                    ctx.metrics.mark_loop_activity();
                 }
                 Err(e) if e.is_stopped() => return StepOutcome::Stopped,
                 Err(e) if e.is_disconnected() => {

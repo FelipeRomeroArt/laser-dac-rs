@@ -29,8 +29,54 @@ pub use engine::PresentationEngine;
 #[cfg(feature = "testutils")]
 pub(crate) use slice_pipeline::SlicePipeline;
 
+use crate::config::IdlePolicy;
 use crate::point::LaserPoint;
 use std::sync::Arc;
+use std::time::Duration;
+
+// =============================================================================
+// Shared time & blanking helpers (used by SlicePipeline and ChunkProducer)
+// =============================================================================
+
+/// Convert a duration to a point count at the given rate, rounded up.
+/// Zero duration or zero pps yields zero points.
+pub(crate) fn duration_to_points(d: Duration, pps: u32) -> usize {
+    if d.is_zero() || pps == 0 {
+        0
+    } else {
+        (d.as_secs_f64() * pps as f64).ceil() as usize
+    }
+}
+
+/// Convert a microsecond count to a point count at the given rate, rounded up.
+/// Zero micros or zero pps yields zero points.
+pub(crate) fn duration_micros_to_points(micros: u64, pps: u32) -> usize {
+    if micros == 0 || pps == 0 {
+        0
+    } else {
+        (micros as f64 * pps as f64 / 1_000_000.0).ceil() as usize
+    }
+}
+
+/// The blank park point implied by an idle policy: `Park { x, y }` parks at the
+/// given position; every other policy parks at the origin.
+pub(crate) fn park_point(idle_policy: &IdlePolicy) -> LaserPoint {
+    match idle_policy {
+        IdlePolicy::Park { x, y } => LaserPoint::blanked(*x, *y),
+        _ => LaserPoint::blanked(0.0, 0.0),
+    }
+}
+
+/// Blank (zero all four color channels of) every point in `buffer`.
+/// Coordinates are left untouched so positions stay continuous.
+pub(crate) fn blank_prefix(buffer: &mut [LaserPoint]) {
+    for p in buffer {
+        p.r = 0;
+        p.g = 0;
+        p.b = 0;
+        p.intensity = 0;
+    }
+}
 
 // =============================================================================
 // OutputFilter

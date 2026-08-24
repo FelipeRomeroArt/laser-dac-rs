@@ -9,6 +9,7 @@ use crate::protocols::lasercube_usb::dac::Stream;
 use crate::protocols::lasercube_usb::error::Error as UsbError;
 use crate::protocols::lasercube_usb::protocol::Sample as LaserCubeUsbSample;
 use crate::protocols::lasercube_usb::{rusb, DacController};
+use crate::protocols::usb_transfer::is_fatal_rusb;
 use std::time::Instant;
 
 /// LaserCube USB DAC backend (LaserDock).
@@ -76,9 +77,7 @@ enum StreamErrorClass {
 /// transient. Pure and hardware-free so it can be unit-tested exhaustively.
 fn classify_stream_error(err: &UsbError) -> StreamErrorClass {
     match err {
-        UsbError::Usb(rusb::Error::NoDevice | rusb::Error::Io | rusb::Error::Pipe) => {
-            StreamErrorClass::Fatal
-        }
+        UsbError::Usb(inner) if is_fatal_rusb(inner) => StreamErrorClass::Fatal,
         UsbError::DeviceNotOpened => StreamErrorClass::Fatal,
         _ => StreamErrorClass::Transient,
     }
