@@ -25,7 +25,10 @@
 //! # Disconnect Behavior
 //!
 //! By default, streams do not reconnect — on disconnect, `run()` returns
-//! `RunExit::Disconnected`. Configure reconnection via
+//! `RunExit::Disconnected`. When reconnection is enabled but a replacement
+//! device fails validation, `run()` returns `RunExit::IncompatibleDevice`
+//! instead (a deterministic mismatch that retrying cannot fix). Configure
+//! reconnection via
 //! [`StreamConfig::with_reconnect`](crate::StreamConfig::with_reconnect) or
 //! [`FrameSessionConfig::with_reconnect`](crate::FrameSessionConfig::with_reconnect).
 //! New streams always start disarmed for safety.
@@ -256,6 +259,11 @@ pub enum RunExit {
     ProducerEnded,
     /// Device disconnected. No auto-reconnect; new streams start disarmed.
     Disconnected,
+    /// Reconnected device was rejected during validation: incompatible
+    /// backend type, output model, or PPS range. Retrying cannot fix this —
+    /// the replacement device fundamentally doesn't match what the session
+    /// was configured for.
+    IncompatibleDevice,
 }
 
 // =============================================================================
@@ -589,6 +597,8 @@ impl Stream {
     /// - **`RunExit::Stopped`**: Stop requested via `StreamControl::stop()`.
     /// - **`RunExit::ProducerEnded`**: Callback returned `ChunkResult::End`.
     /// - **`RunExit::Disconnected`**: Device disconnected.
+    /// - **`RunExit::IncompatibleDevice`**: A reconnected device failed
+    ///   validation (backend type, output model, or PPS range mismatch).
     ///
     /// # Example
     ///
@@ -673,7 +683,7 @@ impl Stream {
             move |_info: &DacInfo, new_backend: &BackendKind, pps: u32| {
                 if new_backend.is_frame_swap() {
                     log::error!("reconnected device is frame-swap, incompatible with streaming");
-                    return Err(RunExit::Disconnected);
+                    return Err(RunExit::IncompatibleDevice);
                 }
                 if new_backend.caps().output_model != expected_output_model {
                     log::error!(
@@ -682,11 +692,11 @@ impl Stream {
                         new_backend.caps().output_model,
                         expected_output_model
                     );
-                    return Err(RunExit::Disconnected);
+                    return Err(RunExit::IncompatibleDevice);
                 }
                 if Dac::validate_pps(new_backend.caps(), pps).is_err() {
                     log::error!("reconnected device PPS range incompatible with stream config");
-                    return Err(RunExit::Disconnected);
+                    return Err(RunExit::IncompatibleDevice);
                 }
                 Ok(())
             },
