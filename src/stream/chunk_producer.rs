@@ -4,6 +4,8 @@
 //! countdown, idle policy, and end-of-stream flag. The streaming-mode analogue
 //! of [`SlicePipeline`](crate::presentation::slice_pipeline::SlicePipeline).
 
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::IdlePolicy;
@@ -15,7 +17,9 @@ use crate::presentation::ColorDelayLine;
 use crate::presentation::{
     blank_prefix, duration_micros_to_points, duration_to_points, park_point,
 };
-use crate::stream::{ChunkRequest, ChunkResult, StreamControl, StreamInstant, StreamStats};
+use crate::stream::{
+    ChunkRequest, ChunkResult, SharedStreamStats, StreamControl, StreamInstant, StreamStats,
+};
 
 type FillFn = Box<dyn FnMut(&ChunkRequest, &mut [LaserPoint]) -> ChunkResult + Send + 'static>;
 
@@ -52,7 +56,9 @@ pub(crate) struct ChunkProducer {
     startup_blank_remaining: usize,
 
     current_instant: StreamInstant,
-    stats: StreamStats,
+    /// Shared with the `Stream` wrapper so `status()`/`into_dac()` can report
+    /// real counters after the producer has been moved onto the driver thread.
+    stats: Arc<SharedStreamStats>,
     ended: bool,
     /// Set when end-of-stream was triggered by `IdlePolicy::Stop` rather
     /// than a producer-emitted `ChunkResult::End`. Drained by the driver
@@ -67,6 +73,7 @@ impl ChunkProducer {
         idle_policy: IdlePolicy,
         startup_blank: Duration,
         initial_capacity: usize,
+        stats: Arc<SharedStreamStats>,
     ) -> Self
     where
         F: FnMut(&ChunkRequest, &mut [LaserPoint]) -> ChunkResult + Send + 'static,
@@ -86,15 +93,15 @@ impl ChunkProducer {
             color_delay_line: ColorDelayLine::new(0),
             startup_blank_remaining: 0,
             current_instant: StreamInstant::new(0),
-            stats: StreamStats::default(),
+            stats,
             ended: false,
             stop_error: None,
         }
     }
 
     #[allow(dead_code)]
-    pub fn stats(&self) -> &StreamStats {
-        &self.stats
+    pub fn stats(&self) -> StreamStats {
+        self.stats.snapshot()
     }
 
     /// Begin a startup-blank window of `points` points (called by the driver
@@ -227,7 +234,7 @@ impl FifoContentSource for ChunkProducer {
                 }
             }
             ChunkResult::Starved => {
-                self.stats.underrun_count += 1;
+                self.stats.underrun_count.fetch_add(1, Ordering::Relaxed);
                 if !self.fill_idle(target_points, is_armed) {
                     self.invalidate();
                     return &[];
@@ -273,8 +280,10 @@ impl FifoContentSource for ChunkProducer {
             self.last_chunk_len = copy;
         }
         self.current_instant += n as u64;
-        self.stats.chunks_written += 1;
-        self.stats.points_written += n as u64;
+        self.stats.chunks_written.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .points_written
+            .fetch_add(n as u64, Ordering::Relaxed);
         self.invalidate();
     }
 
@@ -294,7 +303,7 @@ impl FifoContentSource for ChunkProducer {
         self.color_delay_line.reset();
         self.startup_blank_remaining = 0;
         self.invalidate();
-        self.stats.reconnect_count += 1;
+        self.stats.reconnect_count.fetch_add(1, Ordering::Relaxed);
     }
 
     fn is_ended(&self) -> bool {
@@ -331,7 +340,14 @@ mod tests {
     {
         let (tx, _rx) = mpsc::channel();
         let control = StreamControl::new(tx, Duration::ZERO, 30_000);
-        let cp = ChunkProducer::new(producer, control.clone(), idle, Duration::ZERO, 16);
+        let cp = ChunkProducer::new(
+            producer,
+            control.clone(),
+            idle,
+            Duration::ZERO,
+            16,
+            Arc::new(SharedStreamStats::default()),
+        );
         (cp, control)
     }
 
@@ -355,6 +371,7 @@ mod tests {
             IdlePolicy::Blank,
             startup_blank,
             32,
+            Arc::new(SharedStreamStats::default()),
         );
         (cp, control)
     }
@@ -572,7 +589,14 @@ mod tests {
     {
         let (tx, _rx) = mpsc::channel();
         let control = StreamControl::new(tx, color_delay, pps);
-        let cp = ChunkProducer::new(producer, control.clone(), idle, Duration::ZERO, 32);
+        let cp = ChunkProducer::new(
+            producer,
+            control.clone(),
+            idle,
+            Duration::ZERO,
+            32,
+            Arc::new(SharedStreamStats::default()),
+        );
         (cp, control)
     }
 

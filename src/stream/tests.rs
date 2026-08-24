@@ -2548,7 +2548,7 @@ fn test_stream_instant_operators() {
 #[test]
 fn test_status_reports_connected_stats_and_scheduled_ahead() {
     let backend = TestBackend::new().with_initial_queue(500);
-    let mut stream = make_test_stream(backend); // make_test_stream connects the backend
+    let stream = make_test_stream(backend); // make_test_stream connects the backend
 
     let status = stream.status().unwrap();
     assert!(status.connected, "backend was connected");
@@ -2568,9 +2568,13 @@ fn test_status_reports_connected_stats_and_scheduled_ahead() {
     assert!(status.stats.is_some());
     assert_eq!(status.stats.unwrap().underrun_count, 0);
 
-    // Stats are snapshotted from live state.
-    stream.state.stats.underrun_count = 7;
-    stream.state.stats.reconnect_count = 2;
+    // Stats are snapshotted from live shared state.
+    stream.state.stats.underrun_count.store(7, Ordering::SeqCst);
+    stream
+        .state
+        .stats
+        .reconnect_count
+        .store(2, Ordering::SeqCst);
     let status = stream.status().unwrap();
     let stats = status.stats.unwrap();
     assert_eq!(stats.underrun_count, 7);
@@ -2591,6 +2595,59 @@ fn test_status_reports_disconnected() {
     let status = stream.status().unwrap();
     assert!(!status.connected, "backend was never connected");
     assert_eq!(status.scheduled_ahead_points, 0);
+}
+
+/// End-to-end stats wiring: run a real mock stream through `Stream::run` (the
+/// unified driver path), stop it, and prove the shared counters the driver-
+/// thread ChunkProducer incremented surface via the same handle backing
+/// `status()`/`into_dac()` — previously these were always zero in production.
+#[test]
+fn run_reports_real_stats_after_end_to_end_streaming() {
+    let backend = TestBackend::new();
+    let write_count = Arc::clone(&backend.write_count);
+    let stream = make_test_stream(backend);
+
+    // Grab the shared stats handle BEFORE run() consumes the stream; the
+    // ChunkProducer on the driver thread increments these same atomics.
+    let stats_handle = stream.state.stats.clone();
+    let control = stream.control();
+    control.arm().unwrap();
+
+    let handle = std::thread::spawn(move || {
+        stream.run(
+            |_req, buf| {
+                for p in buf.iter_mut() {
+                    *p = LaserPoint::new(0.5, -0.25, 65535, 0, 0, 65535);
+                }
+                ChunkResult::Filled(buf.len())
+            },
+            |_e| {},
+        )
+    });
+
+    // Wait until the backend has actually accepted at least one write.
+    let start = Instant::now();
+    while write_count.load(Ordering::SeqCst) == 0 && start.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        write_count.load(Ordering::SeqCst) > 0,
+        "stream never wrote a chunk to the backend"
+    );
+
+    control.stop().unwrap();
+    let result = handle.join().expect("stream thread panicked");
+    assert_eq!(result.unwrap(), RunExit::Stopped);
+
+    let stats = stats_handle.snapshot();
+    assert!(
+        stats.chunks_written > 0,
+        "chunks_written must be reported after a real streaming run"
+    );
+    assert!(
+        stats.points_written > 0,
+        "points_written must be reported after a real streaming run"
+    );
 }
 
 // =========================================================================
@@ -2614,6 +2671,9 @@ enum ReplacementKind {
     FrameSwap,
     /// A FIFO backend whose PPS range excludes the stream config PPS.
     NarrowPps,
+    /// A FIFO backend with a compatible PPS range but a different output
+    /// model than the original device — must be rejected by the validator.
+    BlockingModel,
 }
 
 /// FIFO backend with a PPS range [1, 1000] that excludes the 30 kpps test config.
@@ -2672,6 +2732,64 @@ impl FifoBackend for NarrowPpsBackend {
     }
 }
 
+/// FIFO backend whose caps expose [`OutputModel::BlockingFifo`] with a PPS
+/// range fully compatible with the 30 kpps test config. Used to prove that a
+/// replacement is rejected for its OUTPUT MODEL, not its PPS range.
+struct BlockingModelBackend {
+    connected: bool,
+    estimator: SoftwareDecayEstimator,
+}
+
+impl BlockingModelBackend {
+    fn new() -> Self {
+        Self {
+            connected: false,
+            estimator: SoftwareDecayEstimator::new(),
+        }
+    }
+}
+
+impl DacBackend for BlockingModelBackend {
+    fn dac_type(&self) -> DacType {
+        DacType::Custom("StreamRecon".into())
+    }
+    fn caps(&self) -> &DacCapabilities {
+        static CAPS: DacCapabilities = DacCapabilities {
+            pps_min: 1,
+            pps_max: 100_000,
+            max_points_per_chunk: 1000,
+            output_model: crate::device::OutputModel::BlockingFifo,
+        };
+        &CAPS
+    }
+    fn connect(&mut self) -> Result<()> {
+        self.connected = true;
+        Ok(())
+    }
+    fn disconnect(&mut self) -> Result<()> {
+        self.connected = false;
+        Ok(())
+    }
+    fn is_connected(&self) -> bool {
+        self.connected
+    }
+    fn stop(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn set_shutter(&mut self, _open: bool) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl FifoBackend for BlockingModelBackend {
+    fn try_write_points(&mut self, _pps: u32, _points: &[LaserPoint]) -> Result<WriteOutcome> {
+        Ok(WriteOutcome::Written)
+    }
+    fn estimator(&self) -> &dyn BufferEstimator {
+        &self.estimator
+    }
+}
+
 /// Mock discoverer that supplies a replacement backend of a chosen kind when
 /// `open_by_id(STREAM_RECON_ID)` is called during reconnect.
 struct StreamReconDiscoverer {
@@ -2701,6 +2819,9 @@ impl crate::discovery::Discoverer for StreamReconDiscoverer {
                 BackendKind::FrameSwap(Box::new(FrameSwapTestBackend::new()))
             }
             ReplacementKind::NarrowPps => BackendKind::Fifo(Box::new(NarrowPpsBackend::new())),
+            ReplacementKind::BlockingModel => {
+                BackendKind::Fifo(Box::new(BlockingModelBackend::new()))
+            }
         })
     }
 }
@@ -2801,6 +2922,40 @@ fn run_rejects_incompatible_pps_replacement_and_returns_disconnected() {
         "the discoverer must have produced a replacement that was then rejected"
     );
     assert!(!reconnected.load(Ordering::SeqCst));
+}
+
+#[test]
+fn run_rejects_mismatched_output_model_replacement_and_returns_disconnected() {
+    // The pacing adapter is created once from the ORIGINAL device's output
+    // model and cannot be swapped on reconnect. The replacement here has a
+    // fully-compatible PPS range but a different (BlockingFifo) output model;
+    // the validator must reject it and `run()` exits `Disconnected` without
+    // firing on_reconnect.
+    let connect_count = Arc::new(AtomicUsize::new(0));
+    let reconnected = Arc::new(AtomicBool::new(false));
+    let stream = make_reconnecting_stream(
+        DisconnectAfterNBackend::new(2), // NetworkFifo caps
+        ReplacementKind::BlockingModel,
+        connect_count.clone(),
+        reconnected.clone(),
+    );
+
+    let result = stream.run(blank_producer, |_e| {});
+    assert_eq!(
+        result.unwrap(),
+        RunExit::Disconnected,
+        "a replacement with a different OutputModel must be rejected: the \
+         pacing adapter cannot be swapped mid-stream"
+    );
+    assert!(
+        connect_count.load(Ordering::SeqCst) > 0,
+        "the discoverer must have produced a replacement that was then rejected \
+         (proving the validator path, not a discovery miss)"
+    );
+    assert!(
+        !reconnected.load(Ordering::SeqCst),
+        "on_reconnect must not fire on a rejected swap"
+    );
 }
 
 #[test]
