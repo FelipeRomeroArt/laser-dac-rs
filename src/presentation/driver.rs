@@ -154,19 +154,14 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
     let expected_frame_swap = inputs.source.is_frame();
     let mut adapter = output_model::for_backend(&inputs.backend, expected_frame_swap)?;
 
-    let mut shutter_open = false;
-    let mut last_armed = false;
-    let mut error_sink = inputs.error_sink;
-    // Instant the last reconnect completed; gates the flapping-device backoff
-    // floor in `reconnect_backend_with_retry`.
-    let mut last_reconnect_at: Option<Instant> = None;
+    let mut state = LoopState::default();
 
     loop {
         inputs.metrics.mark_loop_activity();
         if inputs.control.is_stop_requested() {
             return Ok(stop_and_close_shutter(
                 &mut inputs.backend,
-                &mut shutter_open,
+                &mut state.shutter_open,
             ));
         }
 
@@ -184,35 +179,27 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
         }
 
         if !inputs.backend.is_connected() {
-            match reconnect(
-                &mut inputs.backend,
-                inputs.reconnect_policy.as_ref(),
-                &inputs.validator,
-                &mut inputs.source,
-                expected_frame_swap,
-                &inputs.control,
-                &mut shutter_open,
-                &mut last_armed,
-                &inputs.metrics,
-                &mut *adapter,
-                &mut last_reconnect_at,
-            ) {
+            match reconnect(&mut inputs, &mut *adapter, &mut state) {
                 Ok(()) => continue,
                 Err(exit) => return Ok(exit),
             }
         }
 
-        if process_control_messages(&inputs.control_rx, &mut shutter_open, &mut inputs.backend) {
+        if process_control_messages(
+            &inputs.control_rx,
+            &mut state.shutter_open,
+            &mut inputs.backend,
+        ) {
             return Ok(stop_and_close_shutter(
                 &mut inputs.backend,
-                &mut shutter_open,
+                &mut state.shutter_open,
             ));
         }
         let is_armed = inputs.control.is_armed();
         handle_shutter_transition(
             is_armed,
-            &mut last_armed,
-            &mut shutter_open,
+            &mut state.last_armed,
+            &mut state.shutter_open,
             &mut inputs.backend,
             &mut inputs.source,
             pps,
@@ -226,8 +213,8 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
                 control: &inputs.control,
                 control_rx: &inputs.control_rx,
                 metrics: &inputs.metrics,
-                shutter_open: &mut shutter_open,
-                error_sink: &mut *error_sink,
+                shutter_open: &mut state.shutter_open,
+                error_sink: &mut inputs.error_sink,
                 target_buffer: inputs.target_buffer,
                 pps,
                 is_armed,
@@ -241,27 +228,13 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
             StepOutcome::Stopped => {
                 return Ok(stop_and_close_shutter(
                     &mut inputs.backend,
-                    &mut shutter_open,
+                    &mut state.shutter_open,
                 ))
             }
-            StepOutcome::Disconnected => {
-                match reconnect(
-                    &mut inputs.backend,
-                    inputs.reconnect_policy.as_ref(),
-                    &inputs.validator,
-                    &mut inputs.source,
-                    expected_frame_swap,
-                    &inputs.control,
-                    &mut shutter_open,
-                    &mut last_armed,
-                    &inputs.metrics,
-                    &mut *adapter,
-                    &mut last_reconnect_at,
-                ) {
-                    Ok(()) => continue,
-                    Err(exit) => return Ok(exit),
-                }
-            }
+            StepOutcome::Disconnected => match reconnect(&mut inputs, &mut *adapter, &mut state) {
+                Ok(()) => continue,
+                Err(exit) => return Ok(exit),
+            },
         }
 
         if inputs.source.is_ended() {
@@ -274,8 +247,8 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
                 control: &inputs.control,
                 control_rx: &inputs.control_rx,
                 metrics: &inputs.metrics,
-                shutter_open: &mut shutter_open,
-                error_sink: &mut *error_sink,
+                shutter_open: &mut state.shutter_open,
+                error_sink: &mut inputs.error_sink,
                 target_buffer: inputs.target_buffer,
                 pps,
                 is_armed,
@@ -287,27 +260,41 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Loop-local mutable state threaded through the driver's reconnect path.
+#[derive(Default)]
+struct LoopState {
+    /// Whether the hardware shutter is currently open.
+    shutter_open: bool,
+    /// Whether the previous iteration saw an armed control handle (drives
+    /// arm/disarm shutter transitions).
+    last_armed: bool,
+    /// Instant the last reconnect completed; gates the flapping-device backoff
+    /// floor in `reconnect_backend_with_retry`.
+    last_reconnect_at: Option<Instant>,
+}
+
 fn reconnect(
-    backend: &mut BackendKind,
-    policy: Option<&ReconnectPolicy>,
-    validator: &ReconnectValidator,
-    source: &mut SourceOwned,
-    expected_frame_swap: bool,
-    control: &StreamControl,
-    shutter_open: &mut bool,
-    last_armed: &mut bool,
-    metrics: &FrameSessionMetrics,
+    inputs: &mut DriverInputs,
     adapter: &mut dyn OutputModelAdapter,
-    last_reconnect_at: &mut Option<Instant>,
+    state: &mut LoopState,
 ) -> std::result::Result<(), RunExit> {
-    let Some(policy) = policy else {
+    let expected_frame_swap = inputs.source.is_frame();
+    let DriverInputs {
+        backend,
+        source,
+        control,
+        metrics,
+        reconnect_policy,
+        validator,
+        ..
+    } = inputs;
+    let Some(policy) = reconnect_policy else {
         return Err(RunExit::Disconnected);
     };
     metrics.set_connected(false);
     let (info, new_backend) = reconnect_backend_with_retry(
         policy,
-        *last_reconnect_at,
+        state.last_reconnect_at,
         || control.is_stop_requested(),
         |info, new_backend| {
             if new_backend.is_frame_swap() != expected_frame_swap {
@@ -323,9 +310,9 @@ fn reconnect(
     )?;
 
     *backend = new_backend;
-    *shutter_open = false;
-    *last_armed = false;
-    *last_reconnect_at = Some(Instant::now());
+    state.shutter_open = false;
+    state.last_armed = false;
+    state.last_reconnect_at = Some(Instant::now());
     metrics.set_connected(true);
 
     source.on_reconnect(&info);
