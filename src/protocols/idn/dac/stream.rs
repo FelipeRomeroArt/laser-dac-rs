@@ -1315,8 +1315,12 @@ impl Stream {
     }
 
     /// Pad a point slice to the minimum sample count by repeating the last point.
+    /// Returns an empty vector for empty input (callers guard against this today,
+    /// but the helper is total so a new caller cannot panic).
     fn pad_points<P: Point>(points: &[P]) -> Vec<P> {
-        let last = *points.last().unwrap();
+        let Some(&last) = points.last() else {
+            return Vec::new();
+        };
         let mut padded = Vec::with_capacity(MIN_SAMPLES_PER_FRAME);
         padded.extend_from_slice(points);
         padded.resize(MIN_SAMPLES_PER_FRAME, last);
@@ -1365,6 +1369,36 @@ fn check_parameter_response(response: &ParameterResponse) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------------------------
+    //  pad_points tests
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn pad_points_empty_input_is_total() {
+        let padded = Stream::pad_points::<PointXyrgbi>(&[]);
+        assert!(padded.is_empty());
+    }
+
+    #[test]
+    fn pad_points_short_input_pads_with_last_point() {
+        let points = [PointXyrgbi::new(1, 2, 3, 4, 5, 6)];
+        let padded = Stream::pad_points(&points);
+        assert_eq!(padded.len(), MIN_SAMPLES_PER_FRAME);
+        assert_eq!(padded[0], points[0]);
+        for p in &padded[1..] {
+            assert_eq!(*p, points[0]);
+        }
+    }
+
+    #[test]
+    fn pad_points_at_or_above_minimum_is_unchanged() {
+        let points: Vec<PointXyrgbi> = (0..MIN_SAMPLES_PER_FRAME as i16)
+            .map(|i| PointXyrgbi::new(i, i, 0, 0, 0, 0))
+            .collect();
+        let padded = Stream::pad_points(&points);
+        assert_eq!(padded, points);
+    }
 
     // -----------------------------------------------------------------------------------------
     //  PointFormat tests

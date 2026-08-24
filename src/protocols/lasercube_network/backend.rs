@@ -5,6 +5,7 @@ use crate::buffer_estimate::BufferEstimator;
 use crate::device::{DacCapabilities, DacType};
 use crate::error::{Error, Result};
 use crate::point::LaserPoint;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use super::diagnostics::LaserCubeNetworkDiagnostics;
 use super::profiles::ConnectionProfile;
@@ -120,12 +121,11 @@ impl FifoBackend for LaserCubeNetworkBackend {
 
 impl Default for LaserCubeNetworkBackend {
     fn default() -> Self {
-        let status = super::status::LaserCubeNetworkStatus::minimal(
-            "0.0.0.0".parse().expect("valid default IP"),
-        );
+        let status =
+            super::status::LaserCubeNetworkStatus::minimal(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let profile = ConnectionProfile::unknown_conservative(DEFAULT_BUFFER_CAPACITY as usize);
         Self::new(AddressedDevice {
-            source_addr: "0.0.0.0:0".parse().expect("valid default socket address"),
+            source_addr: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
             status,
             profile,
             cmd_port: CMD_PORT,
