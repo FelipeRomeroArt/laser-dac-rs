@@ -160,8 +160,10 @@ For perfect loops where the seam endpoints are the same logical point, return
 `Coalesce` to emit that seam point only once and avoid a visible halt.
 
 For frame-swap DACs, if the authored frame plus transition points would exceed
-the hardware capacity (e.g. Helios 4095 points), the transition prefix is
-automatically truncated. Authored frame content is never dropped.
+the hardware capacity (e.g. Helios 4095 points), the transition prefix is trimmed
+first. If the authored frame alone still exceeds capacity, its tail is truncated
+to fit and a warning is logged — keep authored frames within the device's point
+capacity to avoid losing content.
 
 Or disable transition blanking entirely:
 
@@ -293,7 +295,9 @@ let exit = stream.run(
 )?;
 ```
 
-Return `ChunkResult::Filled(n)` to continue, `ChunkResult::End` to stop gracefully.
+Return `ChunkResult::Filled(n)` to continue, `ChunkResult::Starved` when you have no
+data ready right now (the configured [idle policy](#idle-policy) fills the gap and
+the stream keeps running), or `ChunkResult::End` to stop gracefully.
 
 ## Coordinate System
 
@@ -324,6 +328,8 @@ Each backend handles conversion to its native format internally.
 | `ReconnectConfig`     | Configuration for automatic reconnection                |
 | `StreamConfig`        | Stream settings (PPS, buffering, color delay, blanking) |
 | `ChunkRequest`        | Request info for filling point buffer                   |
+| `ChunkResult`         | Producer response: `Filled(n)`, `Starved`, or `End`     |
+| `IdlePolicy`          | Underrun/disarmed behavior: Blank, Park, RepeatLast, Stop |
 | `LaserPoint`          | Single point with position (f32) and color (u16)        |
 | `DacType`             | Enum of supported DAC hardware                          |
 
@@ -372,6 +378,38 @@ let config = FrameSessionConfig::new(30_000)
 ```
 
 Set to `Duration::ZERO` to disable.
+
+### Idle Policy
+
+Controls what the output shows when the stream has nothing to present — either
+because the producer can't keep up (underrun) or the stream is disarmed. Set with
+`.with_idle_policy(...)` on both `StreamConfig` and `FrameSessionConfig`.
+
+| Variant | Behavior |
+| ------- | -------- |
+| `IdlePolicy::Blank` (default) | Output blanked points at the origin (laser off, scanners parked at 0,0) |
+| `IdlePolicy::Park { x, y }` | Park the beam at `(x, y)` with the laser off |
+| `IdlePolicy::RepeatLast` | Repeat the last presented points (underrun only; falls back to `Blank` while disarmed) |
+| `IdlePolicy::Stop` | Stop the stream entirely on underrun |
+
+```rust
+use laser_dac::{IdlePolicy, StreamConfig};
+
+let config = StreamConfig::new(30_000)
+    .with_idle_policy(IdlePolicy::Park { x: -1.0, y: -1.0 });
+```
+
+### Runtime PPS Changes
+
+The point rate of a running stream can be changed without restarting:
+
+```rust
+stream.control().set_pps(60_000); // takes effect within one chunk period
+let current = stream.control().pps();
+```
+
+The stream loop reads the rate atomically each iteration and recalculates timing
+on the fly. Each backend clamps or applies the rate according to its own limits.
 
 ## Features
 

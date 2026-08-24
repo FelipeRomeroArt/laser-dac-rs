@@ -223,8 +223,17 @@ pub fn list_devices_filtered(enabled_types: &EnabledDacTypes) -> BackendResult<V
 /// Open a DAC by ID.
 ///
 /// The ID should match the `id` field returned by [`list_devices`].
-/// IDs are namespaced by protocol (e.g., `etherdream:aa:bb:cc:dd:ee:ff`,
-/// `idn:hostname.local`, `helios:serial`, `avb:device-slug:n`).
+/// IDs are namespaced by protocol; the exact suffix comes from each
+/// backend's discoverer:
+///
+/// - `etherdream:<mac>` (e.g. `etherdream:aa:bb:cc:dd:ee:ff`)
+/// - `idn:<hex unit id>:<service index>` (e.g. `idn:0102030405060708090a0b0c0d0e0f10:1`)
+/// - `helios:<slugified device name>` (fallback when the device name is
+///   unreadable: `helios:usb:<bus>:<port>`)
+/// - `lasercube-network:<mac or ip>` (e.g. `lasercube-network:192.168.1.50`)
+/// - `lasercube-usb:<serial>` (fallback when no serial is readable:
+///   `lasercube-usb:<bus>:<address>`)
+/// - `avb:<slugified device name>:<index>` (e.g. `avb:motu-avb-main:0`)
 pub fn open_device(id: &str) -> BackendResult<Dac> {
     let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
     discovery.open_by_id(id)
