@@ -176,7 +176,9 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
             .source
             .resize_color_delay_micros(color_delay_micros, pps);
         if let Some(slot) = inputs.pending_frame.as_ref() {
-            if let Some(frame) = slot.lock().unwrap().take() {
+            // Poisoning policy: a frame slot is latest-wins state; recover via
+            // `into_inner` instead of propagating a scheduler panic to callers.
+            if let Some(frame) = slot.lock().unwrap_or_else(|p| p.into_inner()).take() {
                 inputs.source.submit_frame(frame);
             }
         }
@@ -332,8 +334,21 @@ fn reconnect(
     }
     adapter.on_reconnect(&info, backend);
 
-    if let Some(cb) = policy.on_reconnect.lock().unwrap().as_mut() {
+    // Poisoning policy: user callbacks are invoked without holding any lock;
+    // the callback slot recovers from poisoning via `into_inner`.
+    let mut cb = policy
+        .on_reconnect
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
+    if let Some(cb) = cb.as_mut() {
         cb(&info);
+    }
+    if cb.is_some() {
+        *policy
+            .on_reconnect
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = cb;
     }
 
     Ok(())
