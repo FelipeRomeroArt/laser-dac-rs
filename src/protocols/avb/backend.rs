@@ -179,9 +179,13 @@ impl RuntimeState {
     }
 
     fn push_point(&self, point: StreamPoint) {
-        self.queue
-            .push(point)
-            .expect("queue capacity validated before push");
+        // Capacity is reserved for exactly the resampler's predicted output
+        // before processing (`has_capacity_for(pending_output_count)`), and the
+        // audio callback only consumes points, so a failed push would mean the
+        // reservation contract was violated. Skip instead of panicking; the
+        // dropped point is preferable to unwinding out of the scheduler thread.
+        let pushed = self.queue.push(point).is_ok();
+        debug_assert!(pushed, "AVB queue push failed despite reserved capacity");
     }
 
     fn has_capacity_for(&self, count: usize) -> bool {

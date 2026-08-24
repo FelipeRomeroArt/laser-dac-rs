@@ -1,3 +1,4 @@
+
 //! Shared transport state for the LaserCube network backend.
 //!
 //! # Poisoning policy
@@ -8,6 +9,8 @@
 //! recovery is safe and a panic must not cascade into every later estimator
 //! poll or ACK processing step. User-supplied callbacks are always invoked
 //! without holding any lock.
+
+use std::net::{IpAddr, Ipv4Addr};
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -130,9 +133,7 @@ impl SharedTransportState {
             inner: Arc::new(Mutex::new(TransportState {
                 profile,
                 connection_type: ConnectionType::Unknown(0),
-                status: LaserCubeNetworkStatus::minimal(
-                    "0.0.0.0".parse().expect("valid default IP"),
-                ),
+                status: LaserCubeNetworkStatus::minimal(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
                 host_queue_len: 0,
                 host_queue_capacity: 0,
                 free_estimate: profile.buffer_total,

@@ -1,6 +1,6 @@
 //! Configuration types for the IDN receiver server.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use super::constants::{IDNFLG_SERVICEMAP_DSID, IDNVAL_STYPE_DMX512, IDNVAL_STYPE_LAPRO, IDN_PORT};
@@ -103,7 +103,7 @@ impl ServerConfig {
             protocol_version: 0x10, // Version 1.0
             services: vec![Service::laser_projector(1, "Laser1")],
             relays: Vec::new(),
-            bind_address: "127.0.0.1:0".parse().unwrap(),
+            bind_address: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             read_timeout: Duration::from_millis(100),
             link_timeout: Duration::from_millis(1000),
             force_disconnect_window: Duration::from_secs(3),
@@ -112,7 +112,7 @@ impl ServerConfig {
 
     /// Create a server configuration that binds to the standard IDN port.
     pub fn new_on_standard_port(hostname: &str) -> Self {
-        Self::new(hostname).with_bind_address(format!("0.0.0.0:{}", IDN_PORT).parse().unwrap())
+        Self::new(hostname).with_bind_address(SocketAddr::from((Ipv4Addr::UNSPECIFIED, IDN_PORT)))
     }
 
     /// Set a custom unit ID.
