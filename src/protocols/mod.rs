@@ -8,6 +8,12 @@
 #[cfg(any(feature = "helios", feature = "lasercube-usb"))]
 pub mod usb_transfer;
 
+/// Shared scaffolding for the audio-clocked backends (AVB, oscilloscope):
+/// lock-free sink state, cpal stream handle seam, and the scratch+resampler
+/// write helper.
+#[cfg(any(feature = "avb", feature = "oscilloscope"))]
+pub mod audio_sink;
+
 #[cfg(feature = "helios")]
 pub mod helios;
 

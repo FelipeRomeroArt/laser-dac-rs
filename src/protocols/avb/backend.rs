@@ -5,13 +5,13 @@ use crate::buffer_estimate::{BufferEstimator, QueueDepthSource, RuntimeAuthority
 use crate::device::{DacCapabilities, DacType};
 use crate::error::{Error, Result};
 use crate::point::LaserPoint;
+use crate::protocols::audio_sink::{push_chunk_resampled, AudioSinkState, RunningAudioStream};
 use crate::protocols::avb::{is_blacklisted_device, normalize_device_name};
 use crate::resample::{CatmullInterp, StreamingResampler};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, SampleFormat};
-use crossbeam_queue::ArrayQueue;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -120,11 +120,10 @@ impl CatmullInterp for StreamPoint {
 }
 
 struct RuntimeState {
-    queue: ArrayQueue<StreamPoint>,
-    sample_rate: u32,
+    /// Lock-free core: point ring + sample rate + last-output atomics (see
+    /// `crate::protocols::audio_sink`).
+    sink: AudioSinkState<StreamPoint>,
     shutter_open: AtomicBool,
-    last_x_bits: AtomicU32,
-    last_y_bits: AtomicU32,
     /// Set by the cpal error callback when the stream dies (e.g. the device
     /// was unplugged). Producer-side calls observe it and surface a
     /// disconnected-class error so the driver's reconnect path engages.
@@ -134,21 +133,18 @@ struct RuntimeState {
 impl RuntimeState {
     fn new(shutter_open: bool, sample_rate: u32) -> Self {
         Self {
-            queue: ArrayQueue::new(queue_capacity_for_rate(sample_rate)),
-            sample_rate,
+            sink: AudioSinkState::new(queue_capacity_for_rate(sample_rate), sample_rate),
             shutter_open: AtomicBool::new(shutter_open),
-            last_x_bits: AtomicU32::new(0.0f32.to_bits()),
-            last_y_bits: AtomicU32::new(0.0f32.to_bits()),
             stream_failed: AtomicBool::new(false),
         }
     }
 
     fn clear_queue(&self) {
-        while self.queue.pop().is_some() {}
+        self.sink.clear_queue()
     }
 
     fn queued_points(&self) -> u64 {
-        self.queue.len() as u64
+        self.sink.queued_points()
     }
 
     fn mark_stream_failed(&self) {
@@ -165,50 +161,35 @@ impl QueueDepthSource for RuntimeState {
         RuntimeState::queued_points(self)
     }
     fn sample_rate(&self) -> u32 {
-        self.sample_rate
+        self.sink.sample_rate()
     }
 }
 
 impl RuntimeState {
-    fn remaining_capacity(&self) -> usize {
-        self.queue.capacity().saturating_sub(self.queue.len())
-    }
-
     fn pop_point(&self) -> Option<StreamPoint> {
-        self.queue.pop()
+        self.sink.pop()
     }
-
-    fn push_point(&self, point: StreamPoint) {
-        // Capacity is reserved for exactly the resampler's predicted output
-        // before processing (`has_capacity_for(pending_output_count)`), and the
-        // audio callback only consumes points, so a failed push would mean the
-        // reservation contract was violated. Skip instead of panicking; the
-        // dropped point is preferable to unwinding out of the scheduler thread.
-        let pushed = self.queue.push(point).is_ok();
-        debug_assert!(pushed, "AVB queue push failed despite reserved capacity");
     }
 
     fn has_capacity_for(&self, count: usize) -> bool {
         if count == 0 {
             return true;
         }
-        self.remaining_capacity() >= count
+        self.sink.has_capacity_for(count)
     }
 
     fn set_last_xy(&self, x: f32, y: f32) {
-        self.last_x_bits.store(x.to_bits(), Ordering::Release);
-        self.last_y_bits.store(y.to_bits(), Ordering::Release);
+        self.sink.set_last_output(x, y);
     }
 
     fn last_xy(&self) -> (f32, f32) {
-        (
-            f32::from_bits(self.last_x_bits.load(Ordering::Acquire)),
-            f32::from_bits(self.last_y_bits.load(Ordering::Acquire)),
-        )
+        self.sink.last_output()
     }
 }
 
-trait RunningAudioStream {}
+// The `RunningAudioStream`/cpal-handle lifecycle seam is shared with the
+// oscilloscope backend via `crate::protocols::audio_sink`; AVB adds only its
+// config-resolution half of the engine trait below.
 
 /// Result of resolving a selector to a concrete stream config, plus the count
 /// of same-named devices visible at resolve time (for the reconnect identity
@@ -228,12 +209,6 @@ trait AudioEngine: Send + Sync {
         runtime: Arc<RuntimeState>,
     ) -> Result<Box<dyn RunningAudioStream>>;
 }
-
-struct CpalRunningStream {
-    _stream: cpal::Stream,
-}
-
-impl RunningAudioStream for CpalRunningStream {}
 
 struct CpalAudioEngine;
 
@@ -290,7 +265,9 @@ impl AudioEngine for CpalAudioEngine {
 
         stream.play().map_err(Error::backend)?;
 
-        Ok(Box::new(CpalRunningStream { _stream: stream }))
+        Ok(crate::protocols::audio_sink::CpalStreamHandle::boxed(
+            stream,
+        ))
     }
 }
 
@@ -637,17 +614,18 @@ impl FifoBackend for AvbBackend {
             return Ok(WriteOutcome::Written);
         }
 
-        if pps > runtime.sample_rate && !self.warned_pps_exceeds_rate {
+        if pps > runtime.sink.sample_rate() && !self.warned_pps_exceeds_rate {
             log::warn!(
                 "AVB: requested PPS {} exceeds device sample rate {}Hz — output will be decimated",
                 pps,
-                runtime.sample_rate
+                runtime.sink.sample_rate()
             );
             self.warned_pps_exceeds_rate = true;
         }
 
         // Keep the resampler phased to the current PPS (a PPS change re-phases).
-        self.resampler.set_rates(pps.max(1), runtime.sample_rate);
+        self.resampler
+            .set_rates(pps.max(1), runtime.sink.sample_rate());
 
         // Reserve queue capacity for exactly what the resampler will emit for
         // this chunk, given its carried phase; bail out cleanly if it won't fit.
@@ -657,11 +635,12 @@ impl FifoBackend for AvbBackend {
         }
 
         self.resample_scratch.clear();
-        self.resample_scratch
-            .extend(points.iter().map(StreamPoint::from));
-        let scratch = std::mem::take(&mut self.resample_scratch);
-        self.resampler.process(&scratch, |p| runtime.push_point(p));
-        self.resample_scratch = scratch;
+        push_chunk_resampled(
+            &runtime.sink,
+            &mut self.resample_scratch,
+            |buf| buf.extend(points.iter().map(StreamPoint::from)),
+            &mut self.resampler,
+        );
 
         Ok(WriteOutcome::Written)
     }
@@ -1013,7 +992,9 @@ fn enqueue_points(runtime: &RuntimeState, points: &[LaserPoint]) -> WriteOutcome
     }
 
     for point in points {
-        runtime.push_point(StreamPoint::from(point));
+        // Same reservation-then-push discipline as the realtime path; the
+        // shared `AudioSinkState::push_point` debug-asserts the invariant.
+        runtime.sink.push_point(StreamPoint::from(point));
     }
     WriteOutcome::Written
 }
@@ -1101,6 +1082,7 @@ fn fill_output_buffer_converted<S: Sample + cpal::FromSample<f32>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU32;
     use std::sync::mpsc;
     use std::sync::Mutex;
     use std::thread;
@@ -1842,7 +1824,7 @@ mod tests {
                 &selector,
                 SelectedStreamConfig {
                     channels: CHANNELS_XYRGBI as u16,
-                    sample_rate: runtime.sample_rate,
+                    sample_rate: runtime.sink.sample_rate(),
                     sample_format: SampleFormat::F32,
                 },
                 Arc::clone(&runtime),
@@ -1885,7 +1867,7 @@ mod tests {
                 &selector,
                 SelectedStreamConfig {
                     channels: CHANNELS_XYRGBI as u16,
-                    sample_rate: runtime.sample_rate,
+                    sample_rate: runtime.sink.sample_rate(),
                     sample_format: SampleFormat::F32,
                 },
                 Arc::clone(&runtime),
@@ -2010,8 +1992,11 @@ mod tests {
         backend.connect().unwrap();
 
         let runtime = backend.runtime.as_ref().unwrap().clone();
-        assert_eq!(runtime.sample_rate, 96_000);
-        assert_eq!(runtime.queue.capacity(), queue_capacity_for_rate(96_000));
+        assert_eq!(runtime.sink.sample_rate(), 96_000);
+        assert_eq!(
+            runtime.sink.queue.capacity(),
+            queue_capacity_for_rate(96_000)
+        );
 
         // Resampling 2 points at 48kHz to 96kHz with a fresh phase yields
         // total_emittable(2) = floor(1 * 96000/48000) + 1 = 3 output samples.
@@ -2171,9 +2156,9 @@ mod tests {
 
         backend.connect().unwrap();
         let first_runtime = backend.runtime.as_ref().unwrap().clone();
-        assert_eq!(first_runtime.sample_rate, 48_000);
+        assert_eq!(first_runtime.sink.sample_rate(), 48_000);
         assert_eq!(
-            first_runtime.queue.capacity(),
+            first_runtime.sink.queue.capacity(),
             queue_capacity_for_rate(48_000)
         );
         backend.disconnect().unwrap();
@@ -2182,9 +2167,9 @@ mod tests {
 
         backend.connect().unwrap();
         let second_runtime = backend.runtime.as_ref().unwrap().clone();
-        assert_eq!(second_runtime.sample_rate, 96_000);
+        assert_eq!(second_runtime.sink.sample_rate(), 96_000);
         assert_eq!(
-            second_runtime.queue.capacity(),
+            second_runtime.sink.queue.capacity(),
             queue_capacity_for_rate(96_000)
         );
         backend.disconnect().unwrap();
@@ -2324,8 +2309,11 @@ mod tests {
         let runtime = backend.runtime.as_ref().unwrap().clone();
         let opened_configs = fake_engine.opened_stream_configs();
 
-        assert_eq!(runtime.sample_rate, 48_000);
-        assert_eq!(runtime.queue.capacity(), queue_capacity_for_rate(48_000));
+        assert_eq!(runtime.sink.sample_rate(), 48_000);
+        assert_eq!(
+            runtime.sink.queue.capacity(),
+            queue_capacity_for_rate(48_000)
+        );
         assert_eq!(
             opened_configs,
             vec![SelectedStreamConfig {
