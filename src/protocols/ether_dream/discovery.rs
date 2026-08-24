@@ -113,10 +113,7 @@ impl Discoverer for EtherDreamDiscoverer {
 
     fn connect(&mut self, opaque: Box<dyn Any + Send>) -> Result<BackendKind> {
         let data = downcast_connect_data::<ConnectData>(opaque, "EtherDream")?;
-        Ok(BackendKind::Fifo(Box::new(EtherDreamBackend::new(
-            data.broadcast,
-            data.ip,
-        ))))
+        BackendKind::fifo(Box::new(EtherDreamBackend::new(data.broadcast, data.ip)))
     }
 }
 

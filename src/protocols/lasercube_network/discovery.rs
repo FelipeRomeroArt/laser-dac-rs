@@ -496,9 +496,9 @@ impl Discoverer for LaserCubeNetworkDiscoverer {
 
     fn connect(&mut self, opaque: Box<dyn Any + Send>) -> Result<BackendKind> {
         let data = downcast_connect_data::<ConnectData>(opaque, "LaserCube Network")?;
-        Ok(BackendKind::Fifo(Box::new(LaserCubeNetworkBackend::new(
+        BackendKind::fifo(Box::new(LaserCubeNetworkBackend::new(
             data.addressed.clone(),
-        ))))
+        )))
     }
 }
 

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::backend::BackendKind;
 use crate::config::StreamConfig;
-use crate::device::{DacInfo, OutputModel};
+use crate::device::DacInfo;
 use crate::error::{Error, Result};
 use crate::reconnect::ReconnectPolicy;
 use crate::stream::{ControlMsg, RunExit, StreamControl};
@@ -341,18 +341,22 @@ impl FrameSession {
             reconnect: _,
         } = config;
 
+        backend.validate_output_model()?;
+        if !backend.is_connected() {
+            backend.connect()?;
+        }
+
         let mut engine = PresentationEngine::new(transition_fn);
         if backend.is_frame_swap() {
             engine.set_frame_capacity(backend.frame_capacity());
         }
 
-        // Per-OutputModel initial buffer sizing: FIFO bounds by max_points_per_chunk;
-        // frame-swap bounds by frame_capacity (max_points_per_chunk is meaningless there).
-        let initial_buf_capacity = match backend.caps().output_model {
-            OutputModel::UsbFrameSwap => backend.frame_capacity().unwrap_or(0),
-            OutputModel::NetworkFifo | OutputModel::UdpTimed | OutputModel::BlockingFifo => {
-                backend.caps().max_points_per_chunk
-            }
+        // FIFO-vs-frame behavior comes from the runtime variant. Capabilities
+        // only provide capacities within that validated runtime kind.
+        let initial_buf_capacity = if backend.is_frame_swap() {
+            backend.frame_capacity().unwrap_or(0)
+        } else {
+            backend.caps().max_points_per_chunk
         };
         let mut pipeline = SlicePipeline::with_startup_blank(
             engine,
@@ -372,10 +376,6 @@ impl FrameSession {
         };
 
         let validator = Self::reconnect_validator(reconnect_policy.as_ref());
-        if !backend.is_connected() {
-            backend.connect()?;
-        }
-
         let target_buffer = target_buffer_for_backend(&backend);
 
         driver::run(DriverInputs {

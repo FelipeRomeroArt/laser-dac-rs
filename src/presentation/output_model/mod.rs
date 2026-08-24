@@ -342,6 +342,8 @@ pub(crate) fn for_backend(
     source_is_frame: bool,
 ) -> std::result::Result<Box<dyn OutputModelAdapter>, Error> {
     use crate::device::OutputModel;
+
+    backend.validate_output_model()?;
     let model = &backend.caps().output_model;
     let model_is_frame = matches!(model, OutputModel::UsbFrameSwap);
     if model_is_frame != source_is_frame {

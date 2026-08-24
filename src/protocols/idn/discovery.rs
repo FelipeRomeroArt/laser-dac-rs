@@ -171,10 +171,7 @@ impl Discoverer for IdnDiscoverer {
 
     fn connect(&mut self, opaque: Box<dyn Any + Send>) -> Result<BackendKind> {
         let data = downcast_connect_data::<ConnectData>(opaque, "IDN")?;
-        Ok(BackendKind::Fifo(Box::new(IdnBackend::new(
-            data.server,
-            data.service,
-        ))))
+        BackendKind::fifo(Box::new(IdnBackend::new(data.server, data.service)))
     }
 }
 

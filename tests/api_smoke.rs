@@ -109,10 +109,10 @@ impl Discoverer for MockDiscoverer {
 
     fn connect(&mut self, opaque: Box<dyn Any + Send>) -> Result<BackendKind> {
         let _ = downcast_connect_data::<MockConnectData>(opaque, "SmokeDac")?;
-        Ok(BackendKind::Fifo(Box::new(MockBackend {
+        BackendKind::fifo(Box::new(MockBackend {
             connected: false,
             estimator: SoftwareDecayEstimator::new(),
-        })))
+        }))
     }
 }
 

@@ -73,9 +73,7 @@ impl Discoverer for LaserCubeUsbDiscoverer {
 
     fn connect(&mut self, opaque: Box<dyn Any + Send>) -> Result<BackendKind> {
         let data = downcast_connect_data::<ConnectData>(opaque, "LaserCube USB")?;
-        Ok(BackendKind::Fifo(Box::new(LaserCubeUsbBackend::new(
-            data.device,
-        ))))
+        BackendKind::fifo(Box::new(LaserCubeUsbBackend::new(data.device)))
     }
 }
 

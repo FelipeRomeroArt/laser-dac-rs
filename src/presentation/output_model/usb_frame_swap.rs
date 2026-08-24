@@ -31,9 +31,16 @@ impl UsbFrameSwapAdapter {
 
 impl OutputModelAdapter for UsbFrameSwapAdapter {
     fn step(&mut self, ctx: &mut LoopCtx<'_>) -> StepOutcome {
-        if !ctx.backend.is_ready_for_frame() {
-            ctx.sleep_and_mark_activity(Duration::from_millis(1));
-            return StepOutcome::Continue;
+        match ctx.backend.is_ready_for_frame() {
+            Ok(true) => {}
+            Ok(false) => {
+                ctx.sleep_and_mark_activity(Duration::from_millis(1));
+                return StepOutcome::Continue;
+            }
+            Err(err) => {
+                (ctx.error_sink)(err);
+                return StepOutcome::Stopped;
+            }
         }
 
         // The adapter/source pairing is validated once at construction
@@ -57,7 +64,7 @@ impl OutputModelAdapter for UsbFrameSwapAdapter {
         let (n, outcome) = match source.cached_slice() {
             Some(slice) => (
                 slice.len(),
-                ctx.backend.try_write_frame_ready(ctx.pps, slice),
+                ctx.backend.write_frame_after_ready(ctx.pps, slice),
             ),
             None => {
                 self.write_pending = false;
@@ -202,9 +209,9 @@ mod tests {
             self.ready.load(Ordering::SeqCst)
         }
         fn write_frame(&mut self, _pps: u32, points: &[LaserPoint]) -> DacResult<WriteOutcome> {
-            self.write_frame_ready(_pps, points)
+            self.write_frame_after_ready(_pps, points)
         }
-        fn write_frame_ready(
+        fn write_frame_after_ready(
             &mut self,
             _pps: u32,
             points: &[LaserPoint],

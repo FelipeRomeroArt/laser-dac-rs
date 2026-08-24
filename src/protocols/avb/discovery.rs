@@ -90,8 +90,9 @@ impl Discoverer for AvbDiscoverer {
 
     fn connect(&mut self, opaque: Box<dyn Any + Send>) -> Result<BackendKind> {
         let data = downcast_connect_data::<ConnectData>(opaque, "AVB")?;
-        Ok(BackendKind::Fifo(Box::new(
-            AvbBackend::from_selector_with_scan_count(data.selector, data.scan_duplicate_count),
+        BackendKind::fifo(Box::new(AvbBackend::from_selector_with_scan_count(
+            data.selector,
+            data.scan_duplicate_count,
         )))
     }
 }

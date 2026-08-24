@@ -117,9 +117,7 @@ impl Discoverer for HeliosDiscoverer {
 
     fn connect(&mut self, opaque: Box<dyn Any + Send>) -> Result<BackendKind> {
         let data = downcast_connect_data::<ConnectData>(opaque, "Helios")?;
-        Ok(BackendKind::FrameSwap(Box::new(HeliosBackend::from_dac(
-            data.dac,
-        ))))
+        BackendKind::frame_swap(Box::new(HeliosBackend::from_dac(data.dac)))
     }
 }
 

@@ -405,10 +405,10 @@ impl FrameSwapBackend for HeliosBackend {
             Err(e) => return Err(self.map_err_ctx("helios write_frame status poll", e)),
         }
 
-        self.write_frame_ready(pps, points)
+        self.write_frame_after_ready(pps, points)
     }
 
-    fn write_frame_ready(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+    fn write_frame_after_ready(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
         let (pps, num_points, byte_len) = self.prepare_frame_buffer(pps, points);
 
         let write_result = {
@@ -634,10 +634,12 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn write_frame_ready_without_device_is_disconnected() {
+    fn write_frame_after_ready_without_device_is_disconnected() {
         let mut backend = HeliosBackend::new(0);
         let points = vec![LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535)];
-        let err = backend.write_frame_ready(30_000, &points).unwrap_err();
+        let err = backend
+            .write_frame_after_ready(30_000, &points)
+            .unwrap_err();
         assert!(err.is_disconnected());
     }
 
@@ -716,7 +718,7 @@ mod tests {
         assert!(backend.fatal_disconnect);
     }
 
-    // (3) public write_frame success path: Ready -> write_frame_ready -> Written.
+    // (3) public write_frame success path: Ready -> write_frame_after_ready -> Written.
 
     #[test]
     fn write_frame_ready_status_writes_frame_and_reports_written() {

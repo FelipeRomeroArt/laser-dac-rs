@@ -23,7 +23,7 @@ An ordered sequence of [Points](#point) representing one logical image. `Frame` 
 ### Backend
 The runtime object that holds a connection to a single [DAC](#dac) and accepts writes. A backend implements `DacBackend` plus exactly one of `FifoBackend` (stream-of-points model) or `FrameSwapBackend` (whole-frame ping-pong model).
 
-`BackendKind` is the type-erased enum that hides which sub-trait a particular backend implements.
+`BackendKind` is a type-erased wrapper with a private runtime variant. Its fallible constructors ensure the wrapped sub-trait agrees with the backend's advertised output model.
 
 ### OutputModel
 The scheduler-relevant pacing model of a [Backend](#backend). Determines how the presentation scheduler drives writes — pacing, slice sizing, backpressure, and reconnect-state reset. Three variants live in `src/device.rs`:

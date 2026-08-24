@@ -96,10 +96,10 @@ impl Discoverer for OscilloscopeDiscoverer {
 
     fn connect(&mut self, opaque: Box<dyn Any + Send>) -> Result<BackendKind> {
         let data = downcast_connect_data::<ConnectData>(opaque, "Oscilloscope")?;
-        Ok(BackendKind::Fifo(Box::new(OscilloscopeBackend::new(
+        BackendKind::fifo(Box::new(OscilloscopeBackend::new(
             data.info.name.clone(),
             data.info.sample_rate,
-        ))))
+        )))
     }
 }
 
