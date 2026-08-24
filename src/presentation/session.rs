@@ -386,7 +386,12 @@ impl FrameSession {
             metrics,
             reconnect_policy,
             validator,
-            error_sink: Box::new(|_e: Error| { /* frame-mode swallows non-fatal errors */ }),
+            // Frame-mode has no user-facing on_error channel; log non-fatal
+            // errors so they are not silently swallowed. Disconnection still
+            // surfaces via `metrics.connected()`.
+            error_sink: Box::new(|e: Error| {
+                log::warn!("frame-session output error: {e}");
+            }),
             target_buffer,
             drain_timeout: Duration::ZERO,
             pending_frame: Some(frame_slot),
@@ -407,7 +412,7 @@ impl FrameSession {
                     info.caps.pps_min,
                     info.caps.pps_max
                 );
-                return Err(RunExit::Disconnected);
+                return Err(RunExit::IncompatibleDevice);
             }
             Ok(())
         })

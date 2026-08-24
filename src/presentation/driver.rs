@@ -116,7 +116,7 @@ pub(crate) type ReconnectValidator =
     Box<dyn Fn(&DacInfo, &BackendKind, u32) -> std::result::Result<(), RunExit> + Send>;
 
 /// Sink for non-fatal write errors. Stream-mode threads the user's
-/// `on_error`; frame-mode passes a no-op.
+/// `on_error`; frame-mode logs each error as a warning.
 pub(crate) type ErrorSink = Box<dyn FnMut(Error) + Send>;
 
 pub(crate) struct DriverInputs {
@@ -315,7 +315,7 @@ fn reconnect(
                     "'{}' reconnected device has incompatible backend type",
                     policy.target.device_id
                 );
-                return Err(RunExit::Disconnected);
+                return Err(RunExit::IncompatibleDevice);
             }
             validator(info, new_backend, control.pps())
         },

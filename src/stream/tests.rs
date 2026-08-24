@@ -2865,11 +2865,12 @@ fn make_reconnecting_stream(
 }
 
 #[test]
-fn run_rejects_frame_swap_replacement_and_returns_disconnected() {
+fn run_rejects_frame_swap_replacement_and_returns_incompatible_device() {
     // Drive the REAL `Stream::run` driver: the initial FIFO backend disconnects
     // after 2 writes, the discoverer hands back a frame-swap device, and the
     // driver's reconnect → validator path must reject it (frame-swap is
-    // incompatible with streaming) and exit `Disconnected` without reconnecting.
+    // incompatible with streaming) and exit `IncompatibleDevice` without
+    // reconnecting.
     let connect_count = Arc::new(AtomicUsize::new(0));
     let reconnected = Arc::new(AtomicBool::new(false));
     let stream = make_reconnecting_stream(
@@ -2882,7 +2883,7 @@ fn run_rejects_frame_swap_replacement_and_returns_disconnected() {
     let result = stream.run(blank_producer, |_e| {});
     assert_eq!(
         result.unwrap(),
-        RunExit::Disconnected,
+        RunExit::IncompatibleDevice,
         "a frame-swap replacement is incompatible with streaming"
     );
     assert!(
@@ -2897,9 +2898,9 @@ fn run_rejects_frame_swap_replacement_and_returns_disconnected() {
 }
 
 #[test]
-fn run_rejects_incompatible_pps_replacement_and_returns_disconnected() {
+fn run_rejects_incompatible_pps_replacement_and_returns_incompatible_device() {
     // Same path, but the replacement's PPS range excludes the 30 kpps config —
-    // the validator must reject it and `run()` exits `Disconnected`.
+    // the validator must reject it and `run()` exits `IncompatibleDevice`.
     let connect_count = Arc::new(AtomicUsize::new(0));
     let reconnected = Arc::new(AtomicBool::new(false));
     let stream = make_reconnecting_stream(
@@ -2912,7 +2913,7 @@ fn run_rejects_incompatible_pps_replacement_and_returns_disconnected() {
     let result = stream.run(blank_producer, |_e| {});
     assert_eq!(
         result.unwrap(),
-        RunExit::Disconnected,
+        RunExit::IncompatibleDevice,
         "reconnected device PPS range must contain the stream config PPS"
     );
     assert!(
@@ -2923,12 +2924,12 @@ fn run_rejects_incompatible_pps_replacement_and_returns_disconnected() {
 }
 
 #[test]
-fn run_rejects_mismatched_output_model_replacement_and_returns_disconnected() {
+fn run_rejects_mismatched_output_model_replacement_and_returns_incompatible_device() {
     // The pacing adapter is created once from the ORIGINAL device's output
     // model and cannot be swapped on reconnect. The replacement here has a
     // fully-compatible PPS range but a different (BlockingFifo) output model;
-    // the validator must reject it and `run()` exits `Disconnected` without
-    // firing on_reconnect.
+    // the validator must reject it and `run()` exits `IncompatibleDevice`
+    // without firing on_reconnect.
     let connect_count = Arc::new(AtomicUsize::new(0));
     let reconnected = Arc::new(AtomicBool::new(false));
     let stream = make_reconnecting_stream(
@@ -2941,7 +2942,7 @@ fn run_rejects_mismatched_output_model_replacement_and_returns_disconnected() {
     let result = stream.run(blank_producer, |_e| {});
     assert_eq!(
         result.unwrap(),
-        RunExit::Disconnected,
+        RunExit::IncompatibleDevice,
         "a replacement with a different OutputModel must be rejected: the \
          pacing adapter cannot be swapped mid-stream"
     );

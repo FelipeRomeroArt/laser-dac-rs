@@ -539,11 +539,11 @@ mod tests {
         let validated_cb = validated.clone();
         let reject = move |_info: &DacInfo, _backend: &BackendKind| {
             validated_cb.store(true, Ordering::SeqCst);
-            Err(RunExit::Disconnected)
+            Err(RunExit::IncompatibleDevice)
         };
 
         let result = reconnect_backend_with_retry(&policy, None, || false, reject, || {});
-        assert_eq!(result.err(), Some(RunExit::Disconnected));
+        assert_eq!(result.err(), Some(RunExit::IncompatibleDevice));
         assert!(
             validated.load(Ordering::SeqCst),
             "validate closure should have run on the opened device"
