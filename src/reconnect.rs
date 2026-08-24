@@ -132,8 +132,23 @@ where
     FValidate: Fn(&DacInfo, &BackendKind) -> std::result::Result<(), RunExit>,
     FProgress: FnMut(),
 {
-    if let Some(cb) = policy.on_disconnect.lock().unwrap().as_mut() {
+    // Crate poisoning policy: user callbacks are invoked without holding any
+    // lock, and the callback slot itself recovers from poisoning via
+    // `into_inner` so a panic inside a callback cannot cascade into every
+    // later reconnect cycle.
+    let mut cb = policy
+        .on_disconnect
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
+    if let Some(cb) = cb.as_mut() {
         cb(&Error::disconnected("backend disconnected"));
+    }
+    if cb.is_some() {
+        *policy
+            .on_disconnect
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = cb;
     }
 
     // Flapping guard: back off before the first attempt when the previous

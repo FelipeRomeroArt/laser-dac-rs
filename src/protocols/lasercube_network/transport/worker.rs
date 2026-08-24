@@ -192,20 +192,12 @@ impl<S: DatagramSocket> TransportWorker<S> {
 
     fn set_rate(&mut self, point_rate: u32) -> io::Result<()> {
         let point_rate = {
-            let state = self
-                .state
-                .inner
-                .lock()
-                .expect("LaserCube transport state poisoned");
+            let state = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
             super::super::clamp_point_rate(&state.status, point_rate)
         };
         send_repeated(&self.cmd_socket, &command::set_rate(point_rate))?;
         self.current_rate = point_rate;
-        let mut state = self
-            .state
-            .inner
-            .lock()
-            .expect("LaserCube transport state poisoned");
+        let mut state = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
         state.point_rate = point_rate;
         state.status.point_rate = point_rate;
         Ok(())
@@ -222,11 +214,8 @@ impl<S: DatagramSocket> TransportWorker<S> {
                         let reported_output_enabled = status.output_enabled;
                         let interlock_enabled = status.interlock_enabled;
                         {
-                            let mut state = self
-                                .state
-                                .inner
-                                .lock()
-                                .expect("LaserCube transport state poisoned");
+                            let mut state =
+                                self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
                             apply_status(&mut state, status, now);
                         }
                         self.reconcile_output_enable(reported_output_enabled, interlock_enabled);
@@ -257,11 +246,7 @@ impl<S: DatagramSocket> TransportWorker<S> {
             }
         }
         if ack_count > 0 {
-            let mut state = self
-                .state
-                .inner
-                .lock()
-                .expect("LaserCube transport state poisoned");
+            let mut state = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
             state.acks_received = state.acks_received.saturating_add(ack_count);
         }
     }
@@ -280,11 +265,7 @@ impl<S: DatagramSocket> TransportWorker<S> {
 
     fn apply_data_ack(&mut self, now: Instant, ack: BufferAck, sequence: u8) {
         let prev_sequence = {
-            let state = self
-                .state
-                .inner
-                .lock()
-                .expect("LaserCube transport state poisoned");
+            let state = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
             state.last_data_ack_sequence
         };
         // Take this packet's send slot regardless (records RTT, frees the slot).
@@ -297,11 +278,7 @@ impl<S: DatagramSocket> TransportWorker<S> {
         // out-of-order or duplicated ACKs must not rewind the buffer estimate.
         if let Some(prev) = prev_sequence {
             if !seq_newer(prev, sequence) {
-                let mut state = self
-                    .state
-                    .inner
-                    .lock()
-                    .expect("LaserCube transport state poisoned");
+                let mut state = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
                 state.last_comms = Some(now);
                 if let Some(rtt) = rtt {
                     state.last_ack_rtt = Some(rtt);
@@ -333,11 +310,7 @@ impl<S: DatagramSocket> TransportWorker<S> {
         // Remaining outstanding packets were sent after this ACK's packet and
         // are not yet reflected in its reported free space — discount them.
         let in_flight = self.in_flight_samples();
-        let mut state = self
-            .state
-            .inner
-            .lock()
-            .expect("LaserCube transport state poisoned");
+        let mut state = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
         let adjusted_free = (ack.free_space as usize).saturating_sub(in_flight);
         state.free_estimate = adjusted_free.min(state.buffer_total);
         state.last_estimate = now;
@@ -355,11 +328,7 @@ impl<S: DatagramSocket> TransportWorker<S> {
         // against data ACKs. Discount all outstanding in-flight samples to stay
         // conservative.
         let in_flight = self.in_flight_samples();
-        let mut state = self
-            .state
-            .inner
-            .lock()
-            .expect("LaserCube transport state poisoned");
+        let mut state = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
         let adjusted_free = (ack.free_space as usize).saturating_sub(in_flight);
         state.free_estimate = adjusted_free.min(state.buffer_total);
         state.last_estimate = now;
@@ -398,11 +367,7 @@ impl<S: DatagramSocket> TransportWorker<S> {
     }
 
     fn decay_free_estimate(&self, now: Instant) {
-        let mut state = self
-            .state
-            .inner
-            .lock()
-            .expect("LaserCube transport state poisoned");
+        let mut state = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
         let elapsed = now.saturating_duration_since(state.last_estimate);
         let drained = (elapsed.as_secs_f64() * state.point_rate as f64) as usize;
         if drained > 0 {
@@ -432,11 +397,7 @@ impl<S: DatagramSocket> TransportWorker<S> {
     /// it should stop (paced, waiting for buffer room, or a send error).
     fn send_one_packet(&mut self, now: Instant) -> bool {
         let (budget, free_estimate, buffer_total, remote_buffer_cutoff, full_packet) = {
-            let state = self
-                .state
-                .inner
-                .lock()
-                .expect("LaserCube transport state poisoned");
+            let state = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
             let budget = send_budget(PacerInputs {
                 queue_len: self.queue.len(),
                 free_estimate: state.free_estimate,
@@ -504,11 +465,7 @@ impl<S: DatagramSocket> TransportWorker<S> {
                 false
             }
         } else {
-            let mut state = self
-                .state
-                .inner
-                .lock()
-                .expect("LaserCube transport state poisoned");
+            let mut state = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
             state.send_errors = state.send_errors.saturating_add(1);
             drop(state);
             for point in self.packet_buffer.drain(..).rev() {
@@ -526,21 +483,13 @@ impl<S: DatagramSocket> TransportWorker<S> {
         let poll_period = full_info_poll_period(self.output_enabled);
         self.next_full_info_due = now + poll_period;
         if self.cmd_socket.send(&command::get_full_info()).is_err() {
-            let mut state = self
-                .state
-                .inner
-                .lock()
-                .expect("LaserCube transport state poisoned");
+            let mut state = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
             state.send_errors = state.send_errors.saturating_add(1);
         }
     }
 
     fn record_output_enabled(&self, enabled: bool) {
-        let mut state = self
-            .state
-            .inner
-            .lock()
-            .expect("LaserCube transport state poisoned");
+        let mut state = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
         state.status.output_enabled = enabled;
     }
 
@@ -548,11 +497,7 @@ impl<S: DatagramSocket> TransportWorker<S> {
         if buffer.len() < 2 {
             return;
         }
-        let mut state = self
-            .state
-            .inner
-            .lock()
-            .expect("LaserCube transport state poisoned");
+        let mut state = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
         if buffer[1] == 0 {
             state.command_successes = state.command_successes.saturating_add(1);
             state.last_comms = Some(now);
@@ -576,11 +521,7 @@ impl<S: DatagramSocket> TransportWorker<S> {
     }
 
     fn record_send(&self, now: Instant, sent: usize) {
-        let mut state = self
-            .state
-            .inner
-            .lock()
-            .expect("LaserCube transport state poisoned");
+        let mut state = self.state.inner.lock().unwrap_or_else(|p| p.into_inner());
         state.free_estimate = state.free_estimate.saturating_sub(sent);
         state.last_estimate = now;
         state.host_queue_len = state.host_queue_len.saturating_sub(sent);

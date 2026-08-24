@@ -1,3 +1,14 @@
+//! Shared transport state for the LaserCube network backend.
+//!
+//! # Poisoning policy
+//!
+//! The crate-wide mutex poisoning policy is: state mutexes (the frame slot
+//! and this transport state) recover from poisoning via
+//! [`Mutex::into_inner`], because they hold monotonic/latest-wins data where
+//! recovery is safe and a panic must not cascade into every later estimator
+//! poll or ACK processing step. User-supplied callbacks are always invoked
+//! without holding any lock.
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -150,10 +161,7 @@ impl SharedTransportState {
         &self,
         points: usize,
     ) -> Result<HostQueueReservation, CommunicationError> {
-        let mut state = self
-            .inner
-            .lock()
-            .expect("LaserCube transport state poisoned");
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if state.host_queue_len.saturating_add(points) > state.host_queue_capacity {
             return Err(CommunicationError::QueueFull);
         }
@@ -166,34 +174,22 @@ impl SharedTransportState {
     }
 
     fn release_host_points(&self, points: usize) {
-        let mut state = self
-            .inner
-            .lock()
-            .expect("LaserCube transport state poisoned");
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         state.host_queue_len = state.host_queue_len.saturating_sub(points);
     }
 
     pub(super) fn clear_host_queue(&self) {
-        let mut state = self
-            .inner
-            .lock()
-            .expect("LaserCube transport state poisoned");
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         state.host_queue_len = 0;
     }
 
     pub(super) fn mark_disconnected(&self) {
-        let mut state = self
-            .inner
-            .lock()
-            .expect("LaserCube transport state poisoned");
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         state.connected = false;
     }
 
     pub fn diagnostics(&self) -> LaserCubeNetworkDiagnostics {
-        let state = self
-            .inner
-            .lock()
-            .expect("LaserCube transport state poisoned");
+        let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
         let free = decayed_free(&state, now);
         let last_comms_age = LaserCubeNetworkDiagnostics::age(now, state.last_comms);
@@ -225,20 +221,14 @@ impl SharedTransportState {
     }
 
     pub(crate) fn is_usable(&self) -> bool {
-        let state = self
-            .inner
-            .lock()
-            .expect("LaserCube transport state poisoned");
+        let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         state.connected && !communication_stale(&state, Instant::now())
     }
 }
 
 impl BufferEstimator for SharedTransportState {
     fn estimated_fullness(&self, now: Instant, _pps: u32) -> u64 {
-        let state = self
-            .inner
-            .lock()
-            .expect("LaserCube transport state poisoned");
+        let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let free = decayed_free(&state, now);
         let device_buffered = state.buffer_total.saturating_sub(free);
         device_buffered.saturating_add(state.host_queue_len) as u64

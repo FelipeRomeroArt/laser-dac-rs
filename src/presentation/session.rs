@@ -292,7 +292,9 @@ impl FrameSession {
     /// Submit a frame for display. Latest-wins: overwrites any unconsumed
     /// pending frame immediately, with no buffering or memory growth.
     pub fn send_frame(&self, frame: Frame) {
-        *self.frame_slot.lock().unwrap() = Some(frame);
+        // Poisoning policy: the frame slot is latest-wins state, so recover
+        // from a poisoned mutex instead of panicking on the caller's thread.
+        *self.frame_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(frame);
     }
 
     /// Returns true if the scheduler thread has finished.
