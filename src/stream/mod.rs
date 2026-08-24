@@ -207,18 +207,44 @@ pub struct StreamStatus {
 }
 
 /// Stream statistics for diagnostics and debugging.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StreamStats {
     /// Number of times the stream underran.
     pub underrun_count: u64,
-    /// Number of chunks that arrived late.
-    pub late_chunk_count: u64,
     /// Number of times the device reconnected.
     pub reconnect_count: u64,
     /// Total chunks written since stream start.
     pub chunks_written: u64,
     /// Total points written since stream start.
     pub points_written: u64,
+}
+
+/// Atomic, shared backing store for [`StreamStats`].
+///
+/// The production streaming path lives entirely on the scheduler thread inside
+/// [`crate::presentation::driver::run`] via [`chunk_producer::ChunkProducer`],
+/// which owns the counters. Sharing one atomic instance between that producer
+/// and the [`Stream`] wrapper lets [`Stream::status`] and
+/// [`Stream::into_dac`] report the real counters without locking or channel
+/// plumbing — including after `run()` (which consumes the `Stream`) has moved
+/// the producer onto the driver thread.
+#[derive(Default)]
+pub(crate) struct SharedStreamStats {
+    underrun_count: AtomicU64,
+    reconnect_count: AtomicU64,
+    chunks_written: AtomicU64,
+    points_written: AtomicU64,
+}
+
+impl SharedStreamStats {
+    pub(crate) fn snapshot(&self) -> StreamStats {
+        StreamStats {
+            underrun_count: self.underrun_count.load(Ordering::Relaxed),
+            reconnect_count: self.reconnect_count.load(Ordering::Relaxed),
+            chunks_written: self.chunks_written.load(Ordering::Relaxed),
+            points_written: self.points_written.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// How a callback-mode stream run ended.
@@ -383,12 +409,12 @@ impl StreamControl {
 /// Diagnostics carried across a stream's lifetime. The production streaming
 /// path lives entirely in [`crate::presentation::driver::run`] via
 /// [`chunk_producer::ChunkProducer`]; the only state the `Stream` wrapper still
-/// keeps is the stats snapshot surfaced by [`Stream::status`] and
-/// [`Stream::into_dac`].
+/// keeps is the shared stats handle the producer increments, surfaced as
+/// snapshots by [`Stream::status`] and [`Stream::into_dac`].
 #[derive(Default)]
 struct StreamState {
-    /// Statistics.
-    stats: StreamStats,
+    /// Statistics, shared with the driver-thread `ChunkProducer`.
+    stats: Arc<SharedStreamStats>,
 }
 
 impl StreamState {
@@ -467,7 +493,7 @@ impl Stream {
             connected: self.backend.as_ref().is_some_and(|b| b.is_connected()),
             scheduled_ahead_points: buffered,
             device_queued_points: Some(buffered),
-            stats: Some(self.state.stats.clone()),
+            stats: Some(self.state.stats.snapshot()),
         })
     }
 
@@ -527,7 +553,7 @@ impl Stream {
 
         // Take the backend (leaves None, so Drop won't try to stop again)
         let backend = self.backend.take();
-        let stats = self.state.stats.clone();
+        let stats = self.state.stats.snapshot();
         let reconnect_target = self
             .reconnect_target
             .take()
@@ -607,9 +633,10 @@ impl Stream {
             self.config.idle_policy.clone(),
             self.config.startup_blank,
             max_points,
+            self.state.stats.clone(),
         );
 
-        let validator = Self::build_reconnect_validator();
+        let validator = Self::build_reconnect_validator(self.info.caps.output_model.clone());
         let metrics = FrameSessionMetrics::new(true);
         // Move the control receiver out of self; the Receiver isn't Clone so we
         // swap in a fresh dummy channel that nothing will drive.
@@ -632,11 +659,29 @@ impl Stream {
         })
     }
 
-    fn build_reconnect_validator() -> crate::presentation::driver::ReconnectValidator {
+    /// Build the reconnect validator for this stream.
+    ///
+    /// `expected_output_model` is the original device's output model. The
+    /// pacing adapter is chosen once from it when the driver starts
+    /// (`output_model::for_backend`) and is NOT recreated on reconnect, so a
+    /// replacement device exposing a different model would silently keep the
+    /// old pacing strategy against a new transport — reject the swap instead.
+    fn build_reconnect_validator(
+        expected_output_model: crate::device::OutputModel,
+    ) -> crate::presentation::driver::ReconnectValidator {
         Box::new(
             move |_info: &DacInfo, new_backend: &BackendKind, pps: u32| {
                 if new_backend.is_frame_swap() {
                     log::error!("reconnected device is frame-swap, incompatible with streaming");
+                    return Err(RunExit::Disconnected);
+                }
+                if new_backend.caps().output_model != expected_output_model {
+                    log::error!(
+                        "reconnected device output model {:?} differs from original {:?}; \
+                         the pacing adapter cannot be swapped mid-stream",
+                        new_backend.caps().output_model,
+                        expected_output_model
+                    );
                     return Err(RunExit::Disconnected);
                 }
                 if Dac::validate_pps(new_backend.caps(), pps).is_err() {
