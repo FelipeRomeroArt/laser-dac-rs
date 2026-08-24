@@ -11,8 +11,8 @@ use super::super::protocol::CMD_GET_FULL_INFO;
 use super::state::SharedTransportState;
 use super::worker::TransportWorker;
 use super::{
-    send_repeated, startup_commands, would_block, AddressedDevice, PriorityCommand,
-    TransportCommand, POINT_QUEUE_CAPACITY,
+    send_repeated, startup_commands, would_block, AddressedDevice, PointBufferPool,
+    PriorityCommand, TransportCommand, POINT_QUEUE_CAPACITY,
 };
 
 /// Per-attempt timeout for the connect-time reachability handshake.
@@ -26,6 +26,7 @@ pub struct TransportHandle {
     generation: Arc<AtomicU64>,
     join: Option<JoinHandle<()>>,
     state: SharedTransportState,
+    pool: Arc<PointBufferPool>,
 }
 
 impl TransportHandle {
@@ -51,6 +52,8 @@ impl TransportHandle {
         let worker_state = state.clone();
         let generation = Arc::new(AtomicU64::new(0));
         let worker_generation = generation.clone();
+        let pool = Arc::new(PointBufferPool::new());
+        let worker_pool = Arc::clone(&pool);
         let (tx, rx) = mpsc::sync_channel(POINT_QUEUE_CAPACITY);
         let (priority_tx, priority_rx) = mpsc::channel();
         let join = thread::Builder::new()
@@ -62,6 +65,7 @@ impl TransportHandle {
                     data_socket,
                     worker_state,
                     worker_generation,
+                    worker_pool,
                 );
                 worker.run(rx, priority_rx);
             })
@@ -73,7 +77,12 @@ impl TransportHandle {
             generation,
             join: Some(join),
             state,
+            pool,
         })
+    }
+
+    pub fn point_pool(&self) -> &Arc<PointBufferPool> {
+        &self.pool
     }
 
     pub fn enqueue(

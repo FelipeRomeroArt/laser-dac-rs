@@ -43,6 +43,40 @@ pub(super) const FULL_INFO_POLL_ACTIVE: Duration = Duration::from_millis(2500);
 pub(super) const COMMS_STALE_TIMEOUT: Duration = Duration::from_millis(6000);
 pub(super) const DIAGNOSTIC_LOG_PERIOD: Duration = Duration::from_secs(1);
 
+/// Bounded free-list of point buffers recycled between the backend (producer
+/// thread) and the transport worker (consumer thread). The producer takes a
+/// buffer, fills it, and hands it to the worker via `enqueue`; the worker
+/// returns the drained buffer after moving the points into its internal queue
+/// so the next chunk reuses that capacity instead of allocating afresh.
+pub(super) struct PointBufferPool {
+    free: crossbeam_queue::ArrayQueue<Vec<super::protocol::Point>>,
+}
+
+impl PointBufferPool {
+    /// Sized to cover the command queue plus in-flight chunks, so in the
+    /// steady state buffers are always recycled rather than dropped.
+    const CAPACITY: usize = 16;
+
+    pub(super) fn new() -> Self {
+        Self {
+            free: crossbeam_queue::ArrayQueue::new(Self::CAPACITY),
+        }
+    }
+
+    /// Take a buffer from the pool, or a fresh empty one when the pool is
+    /// exhausted.
+    pub(super) fn take(&self) -> Vec<super::protocol::Point> {
+        self.free.pop().unwrap_or_default()
+    }
+
+    /// Return a drained buffer to the pool. Dropping it when the pool is full
+    /// is fine: that allocation is simply recreated on a later take.
+    pub(super) fn recycle(&self, mut buf: Vec<super::protocol::Point>) {
+        buf.clear();
+        let _ = self.free.push(buf);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AddressedDevice {
     pub source_addr: SocketAddr,

@@ -30,6 +30,7 @@ pub(super) struct TransportWorker<S> {
     recv_buffer: [u8; 1500],
     generation: Arc<AtomicU64>,
     active_generation: u64,
+    point_pool: Arc<super::PointBufferPool>,
     packet_sequence: u8,
     transfer_sequence: u8,
     packet_send_times: [Option<Instant>; 256],
@@ -52,6 +53,7 @@ impl<S: DatagramSocket> TransportWorker<S> {
         data_socket: S,
         state: SharedTransportState,
         generation: Arc<AtomicU64>,
+        point_pool: Arc<super::PointBufferPool>,
     ) -> Self {
         let current_rate = super::super::clamp_point_rate(&device.status, DEFAULT_POINT_RATE);
         let now = Instant::now();
@@ -66,6 +68,7 @@ impl<S: DatagramSocket> TransportWorker<S> {
             recv_buffer: [0; 1500],
             generation,
             active_generation: 0,
+            point_pool,
             packet_sequence: 0,
             transfer_sequence: 0,
             packet_send_times: [None; 256],
@@ -160,7 +163,7 @@ impl<S: DatagramSocket> TransportWorker<S> {
                 Ok(TransportCommand::Enqueue {
                     generation,
                     point_rate,
-                    points,
+                    mut points,
                     _reservation,
                 }) => {
                     if generation != self.active_generation
@@ -171,7 +174,11 @@ impl<S: DatagramSocket> TransportWorker<S> {
                     if point_rate != self.current_rate {
                         let _ = self.set_rate(point_rate);
                     }
-                    self.queue.extend(points);
+                    self.queue.extend(points.drain(..));
+                    // The points were moved into the worker's queue; hand the
+                    // drained buffer back so the producer can reuse its
+                    // capacity on the next chunk.
+                    self.point_pool.recycle(points);
                     _reservation.commit();
                 }
                 Err(TryRecvError::Disconnected) => {
@@ -728,6 +735,7 @@ mod tests {
         };
         let state = SharedTransportState::new(&status, profile);
         let generation = Arc::new(AtomicU64::new(0));
+        let pool = Arc::new(super::super::PointBufferPool::new());
         let cmd_socket = FakeSocket::default();
         let data_socket = FakeSocket::default();
         let worker = TransportWorker::new(
@@ -736,6 +744,7 @@ mod tests {
             data_socket.clone(),
             state,
             generation,
+            pool,
         );
         (worker, cmd_socket, data_socket)
     }

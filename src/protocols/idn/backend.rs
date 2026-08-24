@@ -8,6 +8,7 @@ use crate::point::LaserPoint;
 use crate::protocols::idn::dac::stream::PointFormat;
 use crate::protocols::idn::dac::{stream, ServerInfo, ServiceInfo};
 use crate::protocols::idn::protocol::{PointExtended, PointXyrgbHighRes, PointXyrgbi};
+use crossbeam_queue::ArrayQueue;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -59,6 +60,63 @@ impl ChunkPoints {
 struct QueuedChunk {
     pps: u32,
     points: ChunkPoints,
+}
+
+/// Bounded free-list of conversion buffers shared between the scheduler
+/// thread (producer) and the worker thread (consumer). The producer takes a
+/// buffer, fills it, and hands it to the worker inside a [`QueuedChunk`]; the
+/// worker returns the drained buffer after sending so the next chunk reuses
+/// its capacity instead of growing a fresh allocation on the hot path.
+struct ChunkBufferPool {
+    xyrgbi: ArrayQueue<Vec<PointXyrgbi>>,
+    high_res: ArrayQueue<Vec<PointXyrgbHighRes>>,
+    extended: ArrayQueue<Vec<PointExtended>>,
+}
+
+impl ChunkBufferPool {
+    /// Sized to cover the full worker queue plus in-flight chunks, so in the
+    /// steady state buffers are always recycled rather than dropped.
+    const CAPACITY: usize = 16;
+
+    fn new() -> Self {
+        Self {
+            xyrgbi: ArrayQueue::new(Self::CAPACITY),
+            high_res: ArrayQueue::new(Self::CAPACITY),
+            extended: ArrayQueue::new(Self::CAPACITY),
+        }
+    }
+
+    fn take_xyrgbi(&self) -> Vec<PointXyrgbi> {
+        self.xyrgbi.pop().unwrap_or_default()
+    }
+
+    fn take_high_res(&self) -> Vec<PointXyrgbHighRes> {
+        self.high_res.pop().unwrap_or_default()
+    }
+
+    fn take_extended(&self) -> Vec<PointExtended> {
+        self.extended.pop().unwrap_or_default()
+    }
+
+    /// Return a sent chunk's backing buffer to the pool. Dropping it when the
+    /// pool is full is fine: that allocation is simply recreated on a later
+    /// take.
+    fn recycle(&self, points: &mut ChunkPoints) {
+        match points {
+            ChunkPoints::Xyrgbi(v) => {
+                v.clear();
+                let _ = self.xyrgbi.push(std::mem::take(v));
+            }
+            ChunkPoints::HighRes(v) => {
+                v.clear();
+                let _ = self.high_res.push(std::mem::take(v));
+            }
+            ChunkPoints::Extended(v) => {
+                v.clear();
+                let _ = self.extended.push(std::mem::take(v));
+            }
+        }
+    }
 }
 
 enum WorkerCommand {
@@ -135,11 +193,10 @@ pub struct IdnBackend {
     service: ServiceInfo,
     runtime: Option<WorkerRuntime>,
     caps: DacCapabilities,
-    /// Scratch conversion buffer. Its backing allocation is handed off to each
-    /// queued chunk via `mem::take`, so a fresh allocation is grown on the next
-    /// write; the field mainly keeps the conversion code allocation-free within
-    /// a single write.
-    point_buffer: Vec<PointXyrgbi>,
+    /// Free-list of conversion buffers recycled with the worker thread; see
+    /// [`ChunkBufferPool`]. Keeps the per-chunk write path allocation-free in
+    /// the steady state for every point format.
+    pool: Arc<ChunkBufferPool>,
     /// Software-only buffer estimator. Driven by `record_send` from inside
     /// `try_write_points`; not yet consulted by the adapter (Phase 1).
     estimator: SoftwareDecayEstimator,
@@ -156,7 +213,7 @@ impl IdnBackend {
             service,
             runtime: None,
             caps: super::default_capabilities(),
-            point_buffer: Vec::new(),
+            pool: Arc::new(ChunkBufferPool::new()),
             estimator: SoftwareDecayEstimator::new(),
             point_format: PointFormat::Xyrgbi,
         }
@@ -182,6 +239,39 @@ impl IdnBackend {
     /// The currently selected wire point format.
     pub fn point_format(&self) -> PointFormat {
         self.point_format
+    }
+
+    /// Convert `points` into the selected wire format, reusing a pooled buffer
+    /// when one is available, and clamp `pps` to the device's maximum rate.
+    /// Runtime rate changes (`StreamControl::set_pps`) bypass start-of-stream
+    /// validation, so this is the last checkpoint before a rate reaches
+    /// hardware (mirroring the other backends' clamping).
+    fn build_chunk(&self, pps: u32, points: &[LaserPoint]) -> QueuedChunk {
+        let pps = pps.min(self.caps.pps_max);
+        let chunk_points = match self.point_format {
+            PointFormat::Xyrgbi => {
+                let mut buf = self.pool.take_xyrgbi();
+                buf.clear();
+                buf.extend(points.iter().map(PointXyrgbi::from));
+                ChunkPoints::Xyrgbi(buf)
+            }
+            PointFormat::XyrgbHighRes => {
+                let mut buf = self.pool.take_high_res();
+                buf.clear();
+                buf.extend(points.iter().map(PointXyrgbHighRes::from));
+                ChunkPoints::HighRes(buf)
+            }
+            PointFormat::Extended => {
+                let mut buf = self.pool.take_extended();
+                buf.clear();
+                buf.extend(points.iter().map(PointExtended::from));
+                ChunkPoints::Extended(buf)
+            }
+        };
+        QueuedChunk {
+            pps,
+            points: chunk_points,
+        }
     }
 }
 
@@ -244,7 +334,9 @@ impl DacBackend for IdnBackend {
         let connected = Arc::new(AtomicBool::new(true));
         let worker_connected = Arc::clone(&connected);
         let point_format = self.point_format;
-        let handle = thread::spawn(move || worker_loop(stream, rx, worker_connected, point_format));
+        let pool = Arc::clone(&self.pool);
+        let handle =
+            thread::spawn(move || worker_loop(stream, rx, worker_connected, point_format, pool));
 
         self.runtime = Some(WorkerRuntime {
             tx,
@@ -297,24 +389,7 @@ impl FifoBackend for IdnBackend {
         }
 
         let n = points.len();
-        let chunk_points = match self.point_format {
-            PointFormat::Xyrgbi => {
-                self.point_buffer.clear();
-                self.point_buffer
-                    .extend(points.iter().map(PointXyrgbi::from));
-                ChunkPoints::Xyrgbi(std::mem::take(&mut self.point_buffer))
-            }
-            PointFormat::XyrgbHighRes => {
-                ChunkPoints::HighRes(points.iter().map(PointXyrgbHighRes::from).collect())
-            }
-            PointFormat::Extended => {
-                ChunkPoints::Extended(points.iter().map(PointExtended::from).collect())
-            }
-        };
-        let chunk = QueuedChunk {
-            pps,
-            points: chunk_points,
-        };
+        let chunk = self.build_chunk(pps, points);
 
         match runtime.tx.try_send(WorkerCommand::Chunk(chunk)) {
             Ok(()) => {
@@ -350,6 +425,7 @@ fn worker_loop<S: WorkerStream>(
     rx: mpsc::Receiver<WorkerCommand>,
     connected: Arc<AtomicBool>,
     point_format: PointFormat,
+    pool: Arc<ChunkBufferPool>,
 ) {
     let mut queue = VecDeque::new();
     let mut last_pps = stream.scan_speed();
@@ -374,7 +450,7 @@ fn worker_loop<S: WorkerStream>(
             }
         }
 
-        if let Some(chunk) = queue.pop_front() {
+        if let Some(mut chunk) = queue.pop_front() {
             let remaining = queue.len();
             log::trace!(
                 "idn worker: sending {} pts, {} queued behind",
@@ -407,6 +483,9 @@ fn worker_loop<S: WorkerStream>(
             } else if !stream.write_frame(&chunk.points) {
                 break;
             }
+            // Return the drained conversion buffer so the producer can reuse
+            // its capacity on the next chunk.
+            pool.recycle(&mut chunk.points);
             continue;
         }
 
@@ -481,10 +560,12 @@ fn handle_worker_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_worker_command, worker_loop, ChunkPoints, QueuedChunk, WorkerCommand, WorkerStream,
-        MAX_CONSECUTIVE_ACK_MISSES,
+        handle_worker_command, worker_loop, ChunkBufferPool, ChunkPoints, QueuedChunk,
+        WorkerCommand, WorkerStream, MAX_CONSECUTIVE_ACK_MISSES,
     };
+    use crate::point::LaserPoint;
     use crate::protocols::idn::dac::stream::PointFormat;
+    use crate::protocols::idn::dac::{ServerInfo, ServiceInfo, ServiceType};
     use crate::protocols::idn::protocol::PointXyrgbi;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -605,7 +686,13 @@ mod tests {
         let worker_connected = Arc::clone(&connected);
 
         let handle = thread::spawn(move || {
-            worker_loop(fake_stream, rx, worker_connected, PointFormat::Xyrgbi)
+            worker_loop(
+                fake_stream,
+                rx,
+                worker_connected,
+                PointFormat::Xyrgbi,
+                Arc::new(ChunkBufferPool::new()),
+            )
         });
 
         tx.send(WorkerCommand::Chunk(test_chunk(1_000, 179)))
@@ -636,7 +723,13 @@ mod tests {
         let worker_connected = Arc::clone(&connected);
 
         let handle = thread::spawn(move || {
-            worker_loop(fake_stream, rx, worker_connected, PointFormat::Xyrgbi)
+            worker_loop(
+                fake_stream,
+                rx,
+                worker_connected,
+                PointFormat::Xyrgbi,
+                Arc::new(ChunkBufferPool::new()),
+            )
         });
 
         // Feed more chunks than the miss threshold; the first send is always an
@@ -656,5 +749,56 @@ mod tests {
             writes.load(Ordering::Acquire) >= MAX_CONSECUTIVE_ACK_MISSES as usize,
             "worker should have attempted the frames before giving up"
         );
+    }
+
+    fn test_backend() -> super::IdnBackend {
+        let server = ServerInfo::new([0u8; 16], "test".to_string(), (1, 0), 0);
+        let service = ServiceInfo {
+            service_id: 0,
+            service_type: ServiceType::LaserProjector,
+            name: "test".to_string(),
+            flags: 0,
+            relay_number: 0,
+        };
+        super::IdnBackend::new(server, service)
+    }
+
+    /// Runtime `set_pps` bypasses start-of-stream validation, so chunk
+    /// construction is the last checkpoint: an out-of-range rate must never
+    /// reach the worker (and from there the device).
+    #[test]
+    fn build_chunk_clamps_pps_to_device_maximum() {
+        let backend = test_backend();
+        let pps_max = super::super::default_capabilities().pps_max;
+        assert_eq!(pps_max, 100_000);
+
+        for requested in [u32::MAX, pps_max + 1, 1_000_000] {
+            let chunk = backend.build_chunk(requested, &[LaserPoint::blanked(0.0, 0.0)]);
+            assert_eq!(
+                chunk.pps, pps_max,
+                "requested {requested} must clamp to pps_max"
+            );
+        }
+
+        let in_range = backend.build_chunk(30_000, &[LaserPoint::blanked(0.0, 0.0)]);
+        assert_eq!(in_range.pps, 30_000);
+    }
+
+    #[test]
+    fn chunk_buffer_pool_recycles_capacity() {
+        let pool = ChunkBufferPool::new();
+
+        let mut buf = pool.take_xyrgbi();
+        assert_eq!(buf.capacity(), 0, "empty pool hands out fresh buffers");
+        buf.extend((0..179).map(|_| PointXyrgbi::new(0, 0, 0, 0, 0, 0)));
+
+        // Simulate the worker returning a sent chunk's buffer.
+        let mut chunk_points = ChunkPoints::Xyrgbi(buf);
+        pool.recycle(&mut chunk_points);
+        assert_eq!(chunk_points.len(), 0);
+
+        let recycled = pool.take_xyrgbi();
+        assert_eq!(recycled.len(), 0);
+        assert_eq!(recycled.capacity(), 179, "capacity must survive recycling");
     }
 }
