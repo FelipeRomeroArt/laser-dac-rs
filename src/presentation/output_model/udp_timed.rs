@@ -80,8 +80,14 @@ impl OutputModelAdapter for UdpTimedAdapter {
         let pps = ctx.control.pps();
         self.recompute_chunk(pps);
 
-        let ContentSourceKind::Fifo(source) = &mut ctx.source else {
-            unreachable!("UdpTimedAdapter requires a Fifo content source");
+        // The adapter/source pairing is validated once at construction
+        // (`for_backend`); this guard keeps any future wiring mistake a
+        // reported error instead of a panic.
+        let source = match &mut ctx.source {
+            ContentSourceKind::Fifo(s) => s,
+            ContentSourceKind::Frame(_) => {
+                return super::source_mismatch(ctx, "UdpTimedAdapter");
+            }
         };
         source.reserve_buf(self.chunk_points);
 

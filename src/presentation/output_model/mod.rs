@@ -317,13 +317,45 @@ pub(crate) fn drain_via_estimator(ctx: &mut LoopCtx<'_>, timeout: Duration) {
     }
 }
 
+/// Defense-in-depth for the adapter/source-model pairing invariant that
+/// [`for_backend`] validates at construction. Reports the violation through the
+/// error sink and stops the loop cleanly instead of panicking.
+pub(crate) fn source_mismatch(ctx: &mut LoopCtx<'_>, adapter: &str) -> StepOutcome {
+    let msg = format!(
+        "{adapter} requires a content source matching its output model \
+         (pairing violated; this is a driver wiring bug)"
+    );
+    log::error!("{msg}");
+    (ctx.error_sink)(Error::invalid_config(msg));
+    StepOutcome::Stopped
+}
+
 /// Construct the adapter for a backend's output model.
-pub(crate) fn for_backend(backend: &BackendKind) -> Box<dyn OutputModelAdapter> {
+///
+/// `source_is_frame` must describe the content source that will drive the
+/// adapter: frame-swap models require a [`FrameContentSource`](super::content_source::FrameContentSource)
+/// and every FIFO model requires a [`FifoContentSource`](super::content_source::FifoContentSource).
+/// A mismatch is a configuration error and returns `Err` rather than building
+/// an adapter that could only fail (or panic) at runtime.
+pub(crate) fn for_backend(
+    backend: &BackendKind,
+    source_is_frame: bool,
+) -> std::result::Result<Box<dyn OutputModelAdapter>, Error> {
     use crate::device::OutputModel;
-    match backend.caps().output_model {
+    let model = &backend.caps().output_model;
+    let model_is_frame = matches!(model, OutputModel::UsbFrameSwap);
+    if model_is_frame != source_is_frame {
+        return Err(Error::invalid_config(format!(
+            "output model {:?} requires a {} content source, got {}",
+            model,
+            if model_is_frame { "frame" } else { "FIFO" },
+            if source_is_frame { "frame" } else { "FIFO" },
+        )));
+    }
+    Ok(match model {
         OutputModel::UsbFrameSwap => Box::new(usb_frame_swap::UsbFrameSwapAdapter::new(backend)),
         OutputModel::NetworkFifo => Box::new(network_fifo::NetworkFifoAdapter::new(backend)),
         OutputModel::UdpTimed => Box::new(udp_timed::UdpTimedAdapter::new(backend)),
         OutputModel::BlockingFifo => Box::new(blocking_fifo::BlockingFifoAdapter::new(backend)),
-    }
+    })
 }

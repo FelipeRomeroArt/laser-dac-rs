@@ -152,7 +152,7 @@ impl DriverInputs {
 /// generalised to either content source.
 pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
     let expected_frame_swap = inputs.source.is_frame();
-    let mut adapter = output_model::for_backend(&inputs.backend);
+    let mut adapter = output_model::for_backend(&inputs.backend, expected_frame_swap)?;
 
     let mut shutter_open = false;
     let mut last_armed = false;

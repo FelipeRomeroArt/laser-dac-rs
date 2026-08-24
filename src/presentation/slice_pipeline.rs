@@ -13,7 +13,10 @@ use crate::point::LaserPoint;
 
 use super::content_source::{FifoContentSource, FrameContentSource};
 use super::engine::{ColorDelayLine, PresentationEngine};
-use super::{Frame, OutputFilter, OutputFilterContext, OutputResetReason, PresentedSliceKind};
+use super::{
+    blank_prefix, duration_micros_to_points, duration_to_points, park_point, Frame, OutputFilter,
+    OutputFilterContext, OutputResetReason, PresentedSliceKind,
+};
 
 pub(crate) struct SlicePipeline {
     engine: PresentationEngine,
@@ -346,22 +349,6 @@ impl FrameContentSource for SlicePipeline {
     }
 }
 
-fn duration_to_points(d: Duration, pps: u32) -> usize {
-    if d.is_zero() || pps == 0 {
-        0
-    } else {
-        (d.as_secs_f64() * pps as f64).ceil() as usize
-    }
-}
-
-fn duration_micros_to_points(micros: u64, pps: u32) -> usize {
-    if micros == 0 || pps == 0 {
-        0
-    } else {
-        (micros as f64 * pps as f64 / 1_000_000.0).ceil() as usize
-    }
-}
-
 /// Apply disarm blanking and startup blanking to a buffer.
 fn apply_blanking(
     is_armed: bool,
@@ -370,19 +357,10 @@ fn apply_blanking(
     idle_policy: &IdlePolicy,
 ) {
     if !is_armed {
-        let park = match idle_policy {
-            IdlePolicy::Park { x, y } => LaserPoint::blanked(*x, *y),
-            _ => LaserPoint::blanked(0.0, 0.0),
-        };
-        buffer.fill(park);
+        buffer.fill(park_point(idle_policy));
     } else if *startup_blank_remaining > 0 {
         let blank_count = buffer.len().min(*startup_blank_remaining);
-        for p in &mut buffer[..blank_count] {
-            p.r = 0;
-            p.g = 0;
-            p.b = 0;
-            p.intensity = 0;
-        }
+        blank_prefix(&mut buffer[..blank_count]);
         *startup_blank_remaining -= blank_count;
     }
 }

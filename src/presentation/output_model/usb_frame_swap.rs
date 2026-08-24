@@ -36,8 +36,14 @@ impl OutputModelAdapter for UsbFrameSwapAdapter {
             return StepOutcome::Continue;
         }
 
-        let ContentSourceKind::Frame(source) = &mut ctx.source else {
-            unreachable!("UsbFrameSwapAdapter requires a Frame content source");
+        // The adapter/source pairing is validated once at construction
+        // (`for_backend`); this guard keeps any future wiring mistake a
+        // reported error instead of a panic.
+        let source = match &mut ctx.source {
+            ContentSourceKind::Frame(s) => s,
+            ContentSourceKind::Fifo(_) => {
+                return super::source_mismatch(ctx, "UsbFrameSwapAdapter");
+            }
         };
 
         if !self.write_pending {

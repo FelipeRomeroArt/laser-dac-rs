@@ -27,7 +27,7 @@ use std::time::Duration;
 use crate::backend::{BackendKind, WriteOutcome};
 use crate::device::DacInfo;
 
-use super::super::content_source::{ContentSourceKind, FifoContentSource};
+use super::super::content_source::ContentSourceKind;
 use super::{LoopCtx, OutputModelAdapter, StepOutcome};
 
 /// Points per blocking write. 512 = 8 × the LaserDock bulk packet (64) and
@@ -39,18 +39,6 @@ const CHUNK_POINTS: usize = 512;
 /// Idle poll interval while disarmed (device consumes nothing, so there is
 /// nothing to write). Short enough that re-arm and stop are handled promptly.
 const IDLE_SLEEP: Duration = Duration::from_millis(2);
-
-/// Re-borrow the loop-context source as a `FifoContentSource`. BlockingFifo is
-/// only ever paired with a Fifo source by the driver; mismatch is a programmer
-/// error.
-fn fifo_source<'a>(source: &'a mut ContentSourceKind<'_>) -> &'a mut dyn FifoContentSource {
-    match source {
-        ContentSourceKind::Fifo(s) => &mut **s,
-        ContentSourceKind::Frame(_) => {
-            unreachable!("BlockingFifoAdapter requires a Fifo content source")
-        }
-    }
-}
 
 pub(crate) struct BlockingFifoAdapter {
     chunk_points: usize,
@@ -87,24 +75,31 @@ impl OutputModelAdapter for BlockingFifoAdapter {
         // Rising arm edge: the ring still holds whatever was queued before the
         // disarm (the device never consumed it). Clear it so stale points don't
         // replay, and drop any slice retained from before the gap.
+        // The adapter/source pairing is validated once at construction
+        // (`for_backend`); this guard keeps any future wiring mistake a
+        // reported error instead of a panic.
+        let source = match &mut ctx.source {
+            ContentSourceKind::Fifo(s) => s,
+            ContentSourceKind::Frame(_) => {
+                return super::source_mismatch(ctx, "BlockingFifoAdapter");
+            }
+        };
+
         if !self.was_armed {
             self.was_armed = true;
             if let Err(e) = ctx.backend.reset_device_buffer() {
                 log::debug!("reset_device_buffer on re-arm failed (non-fatal): {e}");
             }
-            fifo_source(&mut ctx.source).discard_cached();
+            source.discard_cached();
             self.has_retain = false;
         }
 
         let pps = ctx.pps;
         let chunk = self.chunk_points;
-        fifo_source(&mut ctx.source).reserve_buf(chunk);
+        source.reserve_buf(chunk);
 
         if !self.has_retain {
-            if fifo_source(&mut ctx.source)
-                .produce_chunk(chunk, pps, ctx.is_armed)
-                .is_empty()
-            {
+            if source.produce_chunk(chunk, pps, ctx.is_armed).is_empty() {
                 // No content available right now (frame-mode with no frame yet,
                 // or the producer ended). Idle briefly and let the driver's
                 // end-of-stream check run.
@@ -116,7 +111,7 @@ impl OutputModelAdapter for BlockingFifoAdapter {
 
         // Blocking write: `try_write` stalls until the device ring accepts the
         // whole chunk, which is the pacing we rely on.
-        let (n, outcome) = match fifo_source(&mut ctx.source).cached_slice() {
+        let (n, outcome) = match source.cached_slice() {
             Some(slice) => (slice.len(), ctx.backend.try_write(pps, slice)),
             None => {
                 self.has_retain = false;
@@ -127,7 +122,7 @@ impl OutputModelAdapter for BlockingFifoAdapter {
         match outcome {
             Ok(WriteOutcome::Written) => {
                 ctx.metrics.mark_write_success();
-                fifo_source(&mut ctx.source).commit_written(n, ctx.is_armed);
+                source.commit_written(n, ctx.is_armed);
                 self.has_retain = false;
             }
             Ok(WriteOutcome::WouldBlock) => {

@@ -12,6 +12,9 @@ use crate::error::Error;
 use crate::point::LaserPoint;
 use crate::presentation::content_source::FifoContentSource;
 use crate::presentation::ColorDelayLine;
+use crate::presentation::{
+    blank_prefix, duration_micros_to_points, duration_to_points, park_point,
+};
 use crate::stream::{ChunkRequest, ChunkResult, StreamControl, StreamInstant, StreamStats};
 
 type FillFn = Box<dyn FnMut(&ChunkRequest, &mut [LaserPoint]) -> ChunkResult + Send + 'static>;
@@ -140,19 +143,11 @@ impl ChunkProducer {
         delay_micros: u64,
     ) {
         if !is_armed {
-            let park = match &self.idle_policy {
-                IdlePolicy::Park { x, y } => LaserPoint::blanked(*x, *y),
-                _ => LaserPoint::blanked(0.0, 0.0),
-            };
+            let park = park_point(&self.idle_policy);
             self.buf[..n].fill(park);
         } else if self.startup_blank_remaining > 0 {
             let blank_count = n.min(self.startup_blank_remaining);
-            for p in &mut self.buf[..blank_count] {
-                p.r = 0;
-                p.g = 0;
-                p.b = 0;
-                p.intensity = 0;
-            }
+            blank_prefix(&mut self.buf[..blank_count]);
             self.startup_blank_remaining -= blank_count;
         }
 
@@ -316,22 +311,6 @@ impl FifoContentSource for ChunkProducer {
 
     fn take_stop_error(&mut self) -> Option<Error> {
         self.stop_error.take()
-    }
-}
-
-fn duration_to_points(d: Duration, pps: u32) -> usize {
-    if d.is_zero() || pps == 0 {
-        0
-    } else {
-        (d.as_secs_f64() * pps as f64).ceil() as usize
-    }
-}
-
-fn duration_micros_to_points(micros: u64, pps: u32) -> usize {
-    if micros == 0 || pps == 0 {
-        0
-    } else {
-        (micros as f64 * pps as f64 / 1_000_000.0).ceil() as usize
     }
 }
 
