@@ -3,7 +3,7 @@
 //! - [`StreamConfig`] — buffer-driven timing config for `Dac::start_stream` /
 //!   `start_frame_session`, with optional reconnection.
 //! - [`IdlePolicy`] — what to output when the stream is idle (disarmed or
-//!   underrun). [`UnderrunPolicy`] is a deprecated alias.
+//!   underrun).
 //! - [`ReconnectConfig`] — backoff and callback configuration for transparent
 //!   reconnection after a device disconnect.
 
@@ -264,10 +264,6 @@ pub enum IdlePolicy {
     /// Stop the stream entirely on underrun.
     Stop,
 }
-
-/// Deprecated alias — use [`IdlePolicy`] instead.
-#[deprecated(since = "0.8.0", note = "renamed to IdlePolicy")]
-pub type UnderrunPolicy = IdlePolicy;
 
 /// Configuration for automatic reconnection behavior.
 ///

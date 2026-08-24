@@ -137,10 +137,6 @@ pub use device::{
 // Configuration
 pub use config::{IdlePolicy, ReconnectConfig, StreamConfig};
 
-// Deprecated alias for backwards compatibility
-#[allow(deprecated)]
-pub use config::UnderrunPolicy;
-
 // Stream and Dac types
 pub use stream::{
     ChunkRequest, ChunkResult, Dac, RunExit, Stream, StreamControl, StreamInstant, StreamStats,
