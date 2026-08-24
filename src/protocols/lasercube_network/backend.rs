@@ -16,7 +16,6 @@ pub struct LaserCubeNetworkBackend {
     addressed: AddressedDevice,
     transport: Option<TransportHandle>,
     caps: DacCapabilities,
-    point_buffer: Vec<Point>,
     fallback_estimator: SharedTransportState,
 }
 
@@ -28,7 +27,6 @@ impl LaserCubeNetworkBackend {
             addressed,
             transport: None,
             caps,
-            point_buffer: Vec::new(),
         }
     }
 
@@ -100,11 +98,14 @@ impl FifoBackend for LaserCubeNetworkBackend {
             ));
         }
 
-        self.point_buffer.clear();
-        self.point_buffer.extend(points.iter().map(Point::from));
+        // Take a recycled buffer when one is available so the steady-state
+        // hot path does not allocate; the worker returns drained buffers to
+        // the pool after moving the points into its send queue.
+        let mut buffer = transport.point_pool().take();
+        buffer.extend(points.iter().map(Point::from));
 
         // Hand the buffer to the transport by move instead of cloning it.
-        match transport.enqueue(pps, std::mem::take(&mut self.point_buffer)) {
+        match transport.enqueue(pps, buffer) {
             Ok(()) => Ok(WriteOutcome::Written),
             Err(super::error::CommunicationError::QueueFull) => Ok(WriteOutcome::WouldBlock),
             Err(err) => Err(Error::backend(err)),

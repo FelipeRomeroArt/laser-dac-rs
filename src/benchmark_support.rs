@@ -205,11 +205,15 @@ impl DriverThreadEncoder {
                 points: Vec::with_capacity(max_points),
                 bytes: Vec::with_capacity(byte_capacity),
             },
-            // IDN and LaserCube-network start empty on purpose: their backends
-            // hand each chunk's allocation to a worker thread, so the steady
-            // state is an empty buffer that regrows on every write.
-            ChunkTarget::Idn => Self::Idn { points: Vec::new() },
-            ChunkTarget::LaserCubeNetwork => Self::LaserCubeNetwork { points: Vec::new() },
+            // IDN and LaserCube-network recycle their conversion buffers with
+            // the worker through a bounded free-list (see each backend's
+            // buffer pool), so the steady state reuses a warm buffer.
+            ChunkTarget::Idn => Self::Idn {
+                points: Vec::with_capacity(max_points),
+            },
+            ChunkTarget::LaserCubeNetwork => Self::LaserCubeNetwork {
+                points: Vec::with_capacity(max_points),
+            },
             ChunkTarget::LaserCubeUsb => Self::LaserCubeUsb {
                 points: Vec::with_capacity(max_points),
                 bytes: Vec::with_capacity(byte_capacity),
@@ -252,21 +256,19 @@ impl DriverThreadEncoder {
             Self::Idn { points } => {
                 use crate::protocols::idn::PointXyrgbi;
 
+                // The backend takes a recycled buffer from its free-list,
+                // fills it, and hands it to the worker; the worker returns
+                // drained buffers, so capacity is retained across chunks.
                 points.clear();
                 points.extend(slice.iter().map(PointXyrgbi::from));
-                // The backend hands this allocation to its worker via
-                // `mem::take`, so the next chunk grows a fresh one. Dropping
-                // the taken buffer here stands in for the worker consuming it.
-                let handed_off = std::mem::take(points);
-                handed_off.len()
+                points.len()
             }
             Self::LaserCubeNetwork { points } => {
                 use crate::protocols::lasercube_network::BenchmarkPoint;
 
                 points.clear();
                 points.extend(slice.iter().map(BenchmarkPoint::from));
-                let handed_off = std::mem::take(points);
-                handed_off.len()
+                points.len()
             }
             Self::LaserCubeUsb { points, bytes } => {
                 use crate::protocols::lasercube_usb::Sample;
@@ -644,13 +646,13 @@ mod tests {
         assert_eq!(fifo(ChunkTarget::LaserCubeNetwork), 179);
     }
 
-    /// The IDN and LaserCube-network backends hand each chunk's conversion
-    /// buffer to a worker thread, so the driver thread regrows it every write.
-    /// The fixture must reproduce that rather than reusing a warm buffer, or it
-    /// measures a buffer discipline those backends do not have.
+    /// The IDN and LaserCube-network backends recycle their chunk conversion
+    /// buffers with their workers via a bounded free-list, so the driver
+    /// thread's steady state is a warm, reused buffer. The fixture must
+    /// reproduce that rather than regrowing an allocation per write.
     #[cfg(feature = "chunk-pipeline-bench")]
     #[test]
-    fn chunk_pipeline_fixture_models_worker_handoff_allocation() {
+    fn chunk_pipeline_fixture_models_pooled_worker_handoff_allocation() {
         let frame = Frame::new(points(500));
         let mut fixture = ChunkPipelineBenchmark::new(
             frame,
@@ -665,8 +667,8 @@ mod tests {
         match &fixture.encoder {
             DriverThreadEncoder::Idn { points } => assert_eq!(
                 points.capacity(),
-                0,
-                "buffer must be handed off, leaving nothing to reuse next chunk"
+                179,
+                "pooled handoff must reuse one warm buffer across chunks"
             ),
             _ => panic!("expected the IDN encoder"),
         }

@@ -32,8 +32,8 @@ audio-dacs = ["avb", "oscilloscope"]
 helios = ["dep:rusb"]
 lasercube-usb = ["dep:rusb"]
 ether-dream = ["dep:socket2"]
-idn = ["dep:socket2", "dep:if-addrs"]
-lasercube-network = ["dep:socket2", "dep:if-addrs"]
+idn = ["dep:socket2", "dep:if-addrs", "dep:crossbeam-queue"]
+lasercube-network = ["dep:socket2", "dep:if-addrs", "dep:crossbeam-queue"]
 avb = ["dep:cpal", "dep:crossbeam-queue"]
 
 # Oscilloscope XY mode via audio output

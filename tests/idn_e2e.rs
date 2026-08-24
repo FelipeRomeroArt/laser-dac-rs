@@ -431,6 +431,78 @@ fn test_send_frame() {
     );
 }
 
+/// A runtime `set_pps` bypasses start-of-stream validation; the IDN backend
+/// must clamp the rate before it reaches the worker (and from there the wire).
+/// The wire carries the rate as chunk duration (points * 1e6 / scan_speed), so
+/// an unclamped u32::MAX would show up as a near-zero duration.
+#[test]
+fn test_runtime_set_pps_is_clamped_to_device_maximum() {
+    use laser_dac::discovery::DacDiscovery;
+    use laser_dac::protocols::idn::IdnDiscoverer;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let handle = test_server("ClampDAC").unwrap();
+    let server_addr = handle.addr();
+
+    thread::sleep(Duration::from_millis(50));
+
+    let mut discovery = DacDiscovery::new(idn_only().without(DacType::Idn));
+    discovery.register(Box::new(IdnDiscoverer::with_scan_addresses(vec![
+        server_addr,
+    ])));
+
+    let device = discovery
+        .scan()
+        .into_iter()
+        .next()
+        .map(|d| connect_dac(&mut discovery, d))
+        .expect("Should get a device");
+
+    let pps_max = laser_dac::caps_for_dac_type(&DacType::Idn).pps_max;
+
+    let config = StreamConfig::new(30000);
+    let (stream, _info) = device.start_stream(config).expect("Should start stream");
+
+    let control = stream.control();
+    control.arm().unwrap();
+    control.set_pps(u32::MAX);
+
+    let chunks_sent = Arc::new(AtomicUsize::new(0));
+    let chunks_sent_clone = chunks_sent.clone();
+
+    let result = stream.run(
+        move |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
+            let n = req.target_points;
+            buffer[..n].fill(LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535));
+            let count = chunks_sent_clone.fetch_add(1, Ordering::SeqCst);
+            if count >= 5 {
+                ChunkResult::End
+            } else {
+                ChunkResult::Filled(n)
+            }
+        },
+        |err| eprintln!("Stream error: {}", err),
+    );
+
+    assert!(result.is_ok(), "Stream should complete without error");
+
+    let chunks = wait_for_chunks(&handle, 3);
+    assert!(
+        chunks.len() >= 3,
+        "server should have received streamed chunks"
+    );
+    for chunk in chunks.iter().filter(|c| c.point_count > 0) {
+        let effective_rate =
+            (chunk.point_count as u64 * 1_000_000) / (chunk.duration_us.max(1) as u64);
+        assert!(
+            effective_rate <= pps_max as u64,
+            "chunk rate {} pps exceeds device maximum {}",
+            effective_rate,
+            pps_max
+        );
+    }
+}
+
 #[test]
 fn test_connection_loss_detection() {
     use laser_dac::discovery::DacDiscovery;
