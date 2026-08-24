@@ -169,7 +169,6 @@ impl RuntimeState {
     fn pop_point(&self) -> Option<StreamPoint> {
         self.sink.pop()
     }
-    }
 
     fn has_capacity_for(&self, count: usize) -> bool {
         if count == 0 {

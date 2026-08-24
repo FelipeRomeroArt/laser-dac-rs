@@ -1,4 +1,3 @@
-
 //! Shared transport state for the LaserCube network backend.
 //!
 //! # Poisoning policy
