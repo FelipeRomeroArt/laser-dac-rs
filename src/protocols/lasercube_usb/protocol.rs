@@ -162,13 +162,20 @@ impl From<&LaserPoint> for Sample {
     ///
     /// LaserPoint uses f32 coordinates (-1.0 to 1.0) and u16 colors (0-65535).
     /// LaserCube USB uses 12-bit unsigned coordinates (0-4095) and u8 colors.
+    ///
+    /// The wire format carries no separate intensity channel, so the
+    /// `intensity` dimmer is folded (premultiplied) into each color channel
+    /// before the u8 downscale. This matches the LaserCube Network converter
+    /// in `lasercube_network::protocol` so identical `LaserPoint` content
+    /// renders with the same brightness across backends.
     fn from(p: &LaserPoint) -> Self {
+        let dim = |c: u16| -> u16 { ((c as u32 * p.intensity as u32) / 65535) as u16 };
         Sample::new(
             LaserPoint::coord_to_u12(p.x),
             LaserPoint::coord_to_u12(p.y),
-            LaserPoint::color_to_u8(p.r),
-            LaserPoint::color_to_u8(p.g),
-            LaserPoint::color_to_u8(p.b),
+            LaserPoint::color_to_u8(dim(p.r)),
+            LaserPoint::color_to_u8(dim(p.g)),
+            LaserPoint::color_to_u8(dim(p.b)),
         )
     }
 }
@@ -216,5 +223,49 @@ mod tests {
     #[test]
     fn test_sample_size() {
         assert_eq!(std::mem::size_of::<Sample>(), SAMPLE_SIZE_BYTES);
+    }
+
+    // ======================================================================
+    // From<&LaserPoint> conversion tests (intensity folding)
+    // ======================================================================
+
+    /// Lit white point at a fixed position; only intensity varies.
+    fn lit_point(intensity: u16) -> LaserPoint {
+        LaserPoint::new(0.25, -0.25, 65535, 65535, 65535, intensity)
+    }
+
+    #[test]
+    fn sample_from_laser_point_zero_intensity_encodes_black() {
+        // A fully-lit point with intensity 0 must be dark on the wire.
+        let s: Sample = (&lit_point(0)).into();
+        assert_eq!(s.red(), 0);
+        assert_eq!(s.green(), 0);
+        assert_eq!(s.blue(), 0);
+    }
+
+    #[test]
+    fn sample_from_laser_point_full_intensity_unchanged() {
+        // Full intensity must not alter the color channels (65535 -> 255).
+        let s: Sample = (&lit_point(65535)).into();
+        assert_eq!(s.red(), 255);
+        assert_eq!(s.green(), 255);
+        assert_eq!(s.blue(), 255);
+    }
+
+    #[test]
+    fn sample_from_laser_point_mid_intensity_halves() {
+        // dim(65535, 32768) = 32768; color_to_u8(32768)
+        //   = (32768*255 + 32767)/65535 = 8388607/65535 = 128 (rounded).
+        let s: Sample = (&lit_point(32768)).into();
+        assert_eq!(s.red(), 128);
+        assert_eq!(s.green(), 128);
+        assert_eq!(s.blue(), 128);
+    }
+
+    #[test]
+    fn sample_from_laser_point_preserves_coordinates() {
+        let s: Sample = (&lit_point(65535)).into();
+        assert_eq!(s.x, LaserPoint::coord_to_u12(0.25));
+        assert_eq!(s.y, LaserPoint::coord_to_u12(-0.25));
     }
 }

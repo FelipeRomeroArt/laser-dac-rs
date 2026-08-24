@@ -1023,14 +1023,18 @@ impl From<&LaserPoint> for PointXyrgbHighRes {
     ///
     /// Unlike [`PointXyrgbi`], the 16-bit colours are carried through without
     /// downscaling, so this format preserves the crate's full colour depth on
-    /// the wire. Coordinates are inverted to match hardware orientation.
+    /// the wire. The format has no separate intensity channel, so the
+    /// `intensity` dimmer is folded (premultiplied) into each colour channel,
+    /// matching the LaserCube Network converter in `lasercube_network::protocol`.
+    /// Coordinates are inverted to match hardware orientation.
     fn from(p: &LaserPoint) -> Self {
+        let dim = |c: u16| -> u16 { ((c as u32 * p.intensity as u32) / 65535) as u16 };
         PointXyrgbHighRes::new(
             LaserPoint::coord_to_i16_inverted(p.x),
             LaserPoint::coord_to_i16_inverted(p.y),
-            p.r,
-            p.g,
-            p.b,
+            dim(p.r),
+            dim(p.g),
+            dim(p.b),
         )
     }
 }
@@ -1361,6 +1365,46 @@ mod tests {
 
         assert_eq!(idn_point.x, -32767);
         assert_eq!(idn_point.y, 32767);
+    }
+
+    // ==========================================================================
+    // PointXyrgbHighRes Conversion Tests (intensity folding)
+    // ==========================================================================
+
+    #[test]
+    fn test_highres_conversion_zero_intensity_is_black() {
+        // A fully-lit point with intensity 0 must be dark on the wire.
+        let laser_point = LaserPoint::new(0.0, 0.0, 65535, 65535, 65535, 0);
+        let hp: PointXyrgbHighRes = (&laser_point).into();
+
+        assert_eq!((hp.r, hp.g, hp.b), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_highres_conversion_full_intensity_preserves_colors() {
+        // Full intensity must not alter the full-depth colour channels.
+        let laser_point = LaserPoint::new(0.0, 0.0, 65535, 12345, 40000, 65535);
+        let hp: PointXyrgbHighRes = (&laser_point).into();
+
+        assert_eq!((hp.r, hp.g, hp.b), (65535, 12345, 40000));
+    }
+
+    #[test]
+    fn test_highres_conversion_mid_intensity_halves() {
+        // dim(65535, 32768) = 65535*32768/65535 = 32768 (half depth).
+        let laser_point = LaserPoint::new(0.0, 0.0, 65535, 65535, 65535, 32768);
+        let hp: PointXyrgbHighRes = (&laser_point).into();
+
+        assert_eq!((hp.r, hp.g, hp.b), (32768, 32768, 32768));
+    }
+
+    #[test]
+    fn test_highres_conversion_coordinates_inverted_and_preserved() {
+        let laser_point = LaserPoint::new(0.5, -0.5, 65535, 65535, 65535, 65535);
+        let hp: PointXyrgbHighRes = (&laser_point).into();
+
+        assert_eq!(hp.x, LaserPoint::coord_to_i16_inverted(0.5));
+        assert_eq!(hp.y, LaserPoint::coord_to_i16_inverted(-0.5));
     }
 
     #[test]
