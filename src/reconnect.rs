@@ -574,6 +574,41 @@ mod tests {
         );
     }
 
+    /// A panic while holding the on_disconnect slot's lock poisons the mutex.
+    /// The retry helper must recover from the poisoning (via `into_inner`) and
+    /// still invoke the stored callback exactly once — a panicked user callback
+    /// must not silently disable disconnect notifications forever.
+    #[test]
+    fn poisoned_on_disconnect_slot_recovers_and_still_fires() {
+        let fired = Arc::new(AtomicUsize::new(0));
+        let fired_cb = fired.clone();
+        let config = ReconnectConfig::new()
+            .backoff(Duration::from_millis(1))
+            .on_disconnect(move |_err| {
+                fired_cb.fetch_add(1, Ordering::SeqCst);
+            });
+        let connect_count = Arc::new(AtomicUsize::new(0));
+        let (policy, _shutter_close_count, _disconnect_count) =
+            make_policy(config, true, ConnectBehavior::Ok, connect_count.clone());
+
+        // Panic while holding the slot's lock so the mutex is left poisoned
+        // with the callback still stored inside.
+        let slot = policy.on_disconnect.clone();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = slot.lock().unwrap();
+            panic!("poisoning the on_disconnect slot");
+        }));
+        assert!(panicked.is_err(), "the scoped panic must have happened");
+
+        let result = reconnect_backend_with_retry(&policy, None, || false, accept, || {});
+        assert!(result.is_ok(), "reconnect must survive the poisoned slot");
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "stored on_disconnect callback must fire exactly once after recovery"
+        );
+    }
+
     #[test]
     fn retry_exhausts_max_retries_to_disconnected() {
         // Discoverer returns no matching device → open_by_id fails (retriable).

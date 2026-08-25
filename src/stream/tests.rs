@@ -3174,6 +3174,9 @@ fn stream_reconnects_through_run_driver_path() {
     );
 
     let (stream, _info) = device.start_stream(cfg).unwrap();
+    // Grab the shared stats handle before run() consumes the stream, so we can
+    // prove the driver's accepted-swap path bumped the public counter.
+    let stats_handle = stream.state.stats.clone();
     let control = stream.control();
     control.arm().unwrap();
 
@@ -3207,5 +3210,13 @@ fn stream_reconnects_through_run_driver_path() {
     assert!(
         connect_count.load(Ordering::SeqCst) > 0,
         "discoverer connect() should run to reopen the device"
+    );
+
+    // The accepted swap is recorded on the shared stats the driver thread
+    // increments — exactly one successful reconnect happened.
+    assert_eq!(
+        stats_handle.snapshot().reconnect_count,
+        1,
+        "stats must report exactly one reconnect after run() returns"
     );
 }
