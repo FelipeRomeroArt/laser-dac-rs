@@ -12,11 +12,9 @@
 //! slice, the source caches it; [`cached_slice`] returns it back to the adapter
 //! (used for retain-on-`WouldBlock`). On a successful write, the adapter MUST
 //! call [`commit_written`] exactly once. Cache disposal on the explicit reset
-//! path is owned by [`on_reconnect`], which resets the source (and with it the
-//! cache) as part of re-priming the last frame — the driver does not call
-//! [`discard_cached`] separately. [`discard_cached`] is provided as a
-//! decoupled disposal hook (drop the cache without recording a write) for future
-//! callers, but has no call site today. Neither disposal path is a synonym for
+//! path is owned by the shared driver, which calls [`discard_cached`] on arm
+//! and disarm before resetting the rest of the source lifecycle. Reconnect also
+//! resets the source via [`on_reconnect`]. Neither path records a write. Neither disposal path is a synonym for
 //! [`commit_written`]: implementations with per-write derived state
 //! (`ChunkProducer`'s `RepeatLast`, `current_instant`, stats) advance only in
 //! [`commit_written`].
@@ -48,10 +46,7 @@ pub(crate) trait FifoContentSource: Send {
     fn commit_written(&mut self, n: usize, is_armed: bool);
 
     /// Drop the cache without recording a write. NOT a synonym for
-    /// `commit_written`. Currently unused: cache disposal on the reset path is
-    /// owned by [`on_reconnect`](Self::on_reconnect) (which resets the source),
-    /// so this remains a decoupled disposal hook for future callers.
-    #[allow(dead_code)]
+    /// `commit_written`. Used by shared arm/disarm lifecycle handling.
     fn discard_cached(&mut self);
 
     /// Reserve working-buffer capacity for `n` points.
@@ -86,14 +81,14 @@ pub(crate) trait FifoContentSource: Send {
     #[allow(dead_code)]
     fn reset_output_filter(&mut self, _reason: OutputResetReason) {}
 
-    /// Resize the color-delay line for the current pps. Sources that read
-    /// the delay via an atomic on each chunk (`ChunkProducer`) ignore this.
+    /// Update the desired color-delay duration. Sources quantize it only when
+    /// producing fresh output, never while retrying a retained slice.
     #[allow(dead_code)]
-    fn resize_color_delay_micros(&mut self, _micros: u64, _pps: u32) {}
+    fn set_color_delay(&mut self, _delay: std::time::Duration) {}
 
     /// If the source ended because of `IdlePolicy::Stop`, return the
     /// matching error so the driver can propagate it as `Err(Error::Stopped)`
-    /// rather than a graceful `Ok(RunExit::ProducerEnded)`.
+    /// rather than a graceful `Ok(SessionExit::ProducerEnded)`.
     #[allow(dead_code)]
     fn take_stop_error(&mut self) -> Option<Error> {
         None
@@ -113,11 +108,8 @@ pub(crate) trait FrameContentSource: Send {
     /// Record a successful write of `n` points and clear the cache.
     fn commit_written(&mut self, n: usize, is_armed: bool);
 
-    /// Drop the cache without recording a write. Currently unused: cache
-    /// disposal on the reset path is owned by
-    /// [`on_reconnect`](Self::on_reconnect); this is a decoupled disposal hook
-    /// for future callers.
-    #[allow(dead_code)]
+    /// Drop the cache without recording a write. Used by shared arm/disarm
+    /// lifecycle handling.
     fn discard_cached(&mut self);
 
     /// Reset derived state on reconnect.
@@ -144,9 +136,9 @@ pub(crate) trait FrameContentSource: Send {
     #[allow(dead_code)]
     fn reset_output_filter(&mut self, _reason: OutputResetReason) {}
 
-    /// Resize the color-delay line for the current pps.
+    /// Update the desired color-delay duration.
     #[allow(dead_code)]
-    fn resize_color_delay_micros(&mut self, _micros: u64, _pps: u32) {}
+    fn set_color_delay(&mut self, _delay: std::time::Duration) {}
 }
 
 /// Erased borrow of a source for the per-iteration loop context. Adapters

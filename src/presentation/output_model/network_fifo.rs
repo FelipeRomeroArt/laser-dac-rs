@@ -9,8 +9,8 @@ use crate::error::Error;
 
 use super::super::content_source::ContentSourceKind;
 use super::{
-    blank_and_close_shutter, estimator_fullness, process_control_messages, LoopCtx,
-    OutputModelAdapter, StepOutcome,
+    blank_and_close_shutter, close_if_disarmed, estimator_fullness, process_control_messages,
+    ControlAction, LoopCtx, OutputModelAdapter, StepOutcome,
 };
 
 /// Minimum write quantum: don't dribble out tiny chunks. When the buffer
@@ -119,8 +119,15 @@ impl OutputModelAdapter for NetworkFifoAdapter {
                     // (shutter close) is safety-critical and must take effect
                     // promptly rather than waiting for the device to accept the
                     // pending write, which may never happen while stalled.
-                    if process_control_messages(ctx.control_rx, ctx.shutter_open, ctx.backend) {
-                        return StepOutcome::Stopped;
+                    let action = process_control_messages(ctx.control_rx);
+                    close_if_disarmed(ctx.control, ctx.shutter_open, ctx.backend);
+                    match action {
+                        ControlAction::Stop => return StepOutcome::Stopped,
+                        ControlAction::StateChanged => return StepOutcome::StateChanged,
+                        ControlAction::None if !ctx.control.is_armed() => {
+                            return StepOutcome::StateChanged;
+                        }
+                        ControlAction::None => {}
                     }
                     // Bounded staleness: a device wedged in continuous WouldBlock
                     // is treated as disconnected so reconnect can engage.
@@ -184,7 +191,7 @@ mod tests {
     use crate::presentation::session::FrameSessionMetrics;
     use crate::presentation::slice_pipeline::SlicePipeline;
     use crate::presentation::{Frame, TransitionPlan};
-    use crate::stream::{ControlMsg, StreamControl};
+    use crate::session::{ControlMsg, SessionControl};
 
     use super::NetworkFifoAdapter;
 
@@ -270,9 +277,15 @@ mod tests {
         estimator.record_send(Instant::now() + Duration::from_secs(1), 595, PPS);
 
         let mut engine =
-            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+            PresentationEngine::new(Box::new(|_, _, _| TransitionPlan::Transition(Vec::new())));
         engine.set_pending(frame_with_points(2_000));
-        let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+        let mut pipeline = SlicePipeline::new(
+            engine,
+            std::time::Duration::ZERO,
+            None,
+            IdlePolicy::Blank,
+            0,
+        );
 
         let writes = Arc::new(Mutex::new(Vec::new()));
         let backend = FakeFifo {
@@ -286,9 +299,9 @@ mod tests {
         let mut adapter = NetworkFifoAdapter::new(&backend);
 
         let (tx, rx) = mpsc::channel::<ControlMsg>();
-        let control = StreamControl::new(tx, Duration::ZERO, PPS);
+        let control = SessionControl::new(tx, Duration::ZERO, PPS);
         let metrics = FrameSessionMetrics::new(true);
-        let mut shutter = true;
+        let mut shutter = crate::presentation::output_model::ShutterState::Open;
         {
             let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
             let mut ctx = LoopCtx {
@@ -320,9 +333,15 @@ mod tests {
         estimator.record_send(Instant::now(), 100, PPS); // deficit ~500 points
 
         let mut engine =
-            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+            PresentationEngine::new(Box::new(|_, _, _| TransitionPlan::Transition(Vec::new())));
         engine.set_pending(frame_with_points(2_000));
-        let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+        let mut pipeline = SlicePipeline::new(
+            engine,
+            std::time::Duration::ZERO,
+            None,
+            IdlePolicy::Blank,
+            0,
+        );
 
         let writes = Arc::new(Mutex::new(Vec::new()));
         let backend = FakeFifo {
@@ -336,9 +355,9 @@ mod tests {
         let mut adapter = NetworkFifoAdapter::new(&backend);
 
         let (tx, rx) = mpsc::channel::<ControlMsg>();
-        let control = StreamControl::new(tx, Duration::ZERO, PPS);
+        let control = SessionControl::new(tx, Duration::ZERO, PPS);
         let metrics = FrameSessionMetrics::new(true);
-        let mut shutter = true;
+        let mut shutter = crate::presentation::output_model::ShutterState::Open;
         {
             let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
             let mut ctx = LoopCtx {
@@ -367,9 +386,15 @@ mod tests {
     fn disarm_during_wouldblock_spin_closes_shutter() {
         const PPS: u32 = 30_000;
         let mut engine =
-            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+            PresentationEngine::new(Box::new(|_, _, _| TransitionPlan::Transition(Vec::new())));
         engine.set_pending(frame_with_points(2_000));
-        let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+        let mut pipeline = SlicePipeline::new(
+            engine,
+            std::time::Duration::ZERO,
+            None,
+            IdlePolicy::Blank,
+            0,
+        );
 
         let shutter_calls = Arc::new(Mutex::new(Vec::new()));
         let backend = FakeFifo {
@@ -388,9 +413,9 @@ mod tests {
         tx.send(ControlMsg::Disarm).unwrap();
         tx.send(ControlMsg::Stop).unwrap();
 
-        let control = StreamControl::new(tx, Duration::ZERO, PPS);
+        let control = SessionControl::new(tx, Duration::ZERO, PPS);
         let metrics = FrameSessionMetrics::new(true);
-        let mut shutter = true; // armed/open
+        let mut shutter = crate::presentation::output_model::ShutterState::Open; // armed/open
         {
             let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
             let mut ctx = LoopCtx {
@@ -408,7 +433,11 @@ mod tests {
             };
             assert!(matches!(adapter.step(&mut ctx), StepOutcome::Stopped));
         }
-        assert!(!shutter, "shutter must be closed by the in-spin Disarm");
+        assert_eq!(
+            shutter,
+            crate::presentation::output_model::ShutterState::Closed,
+            "shutter must be closed by the in-spin Disarm"
+        );
         assert_eq!(
             shutter_calls.lock().unwrap().as_slice(),
             &[false],
@@ -424,9 +453,15 @@ mod tests {
         const PPS: u32 = 30_000;
 
         let mut engine =
-            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+            PresentationEngine::new(Box::new(|_, _, _| TransitionPlan::Transition(Vec::new())));
         engine.set_pending(frame_with_points(2_000));
-        let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+        let mut pipeline = SlicePipeline::new(
+            engine,
+            std::time::Duration::ZERO,
+            None,
+            IdlePolicy::Blank,
+            0,
+        );
 
         let writes = Arc::new(Mutex::new(Vec::new()));
         let backend = FakeFifo {
@@ -449,9 +484,9 @@ mod tests {
         adapter.on_reconnect(&info, &mut backend);
 
         let (tx, rx) = mpsc::channel::<ControlMsg>();
-        let control = StreamControl::new(tx, Duration::ZERO, PPS);
+        let control = SessionControl::new(tx, Duration::ZERO, PPS);
         let metrics = FrameSessionMetrics::new(true);
-        let mut shutter = true;
+        let mut shutter = crate::presentation::output_model::ShutterState::Open;
         {
             let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
             let mut ctx = LoopCtx {
@@ -489,9 +524,15 @@ mod tests {
         estimator.record_send(Instant::now() + Duration::from_secs(1), 800, PPS);
 
         let mut engine =
-            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+            PresentationEngine::new(Box::new(|_, _, _| TransitionPlan::Transition(Vec::new())));
         engine.set_pending(frame_with_points(2_000));
-        let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+        let mut pipeline = SlicePipeline::new(
+            engine,
+            std::time::Duration::ZERO,
+            None,
+            IdlePolicy::Blank,
+            0,
+        );
 
         let writes = Arc::new(Mutex::new(Vec::new()));
         let backend = FakeFifo {
@@ -505,9 +546,9 @@ mod tests {
         let mut adapter = NetworkFifoAdapter::new(&backend);
 
         let (tx, rx) = mpsc::channel::<ControlMsg>();
-        let control = StreamControl::new(tx, Duration::ZERO, PPS);
+        let control = SessionControl::new(tx, Duration::ZERO, PPS);
         let metrics = FrameSessionMetrics::new(true);
-        let mut shutter = true;
+        let mut shutter = crate::presentation::output_model::ShutterState::Open;
         {
             let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
             let mut ctx = LoopCtx {
@@ -536,9 +577,15 @@ mod tests {
     fn drain_and_blank_closes_shutter_and_writes_blank() {
         const PPS: u32 = 30_000;
         let mut engine =
-            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+            PresentationEngine::new(Box::new(|_, _, _| TransitionPlan::Transition(Vec::new())));
         engine.set_pending(frame_with_points(2_000));
-        let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+        let mut pipeline = SlicePipeline::new(
+            engine,
+            std::time::Duration::ZERO,
+            None,
+            IdlePolicy::Blank,
+            0,
+        );
 
         let writes = Arc::new(Mutex::new(Vec::new()));
         let shutter_calls = Arc::new(Mutex::new(Vec::new()));
@@ -553,9 +600,9 @@ mod tests {
         let mut adapter = NetworkFifoAdapter::new(&backend);
 
         let (tx, rx) = mpsc::channel::<ControlMsg>();
-        let control = StreamControl::new(tx, Duration::ZERO, PPS);
+        let control = SessionControl::new(tx, Duration::ZERO, PPS);
         let metrics = FrameSessionMetrics::new(true);
-        let mut shutter = true;
+        let mut shutter = crate::presentation::output_model::ShutterState::Open;
         {
             let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
             let mut ctx = LoopCtx {
@@ -574,7 +621,11 @@ mod tests {
             // Zero timeout → drain is a no-op; only the blank-and-close runs.
             adapter.drain_and_blank(&mut ctx, Duration::ZERO);
         }
-        assert!(!shutter, "drain_and_blank must close the shutter");
+        assert_eq!(
+            shutter,
+            crate::presentation::output_model::ShutterState::Closed,
+            "drain_and_blank must close the shutter"
+        );
         assert_eq!(
             shutter_calls.lock().unwrap().as_slice(),
             &[false],
@@ -591,14 +642,20 @@ mod tests {
     fn sleep_scaffold() -> (
         BackendKind,
         SlicePipeline,
-        StreamControl,
+        SessionControl,
         mpsc::Receiver<ControlMsg>,
         FrameSessionMetrics,
     ) {
         const PPS: u32 = 30_000;
         let engine =
-            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
-        let pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+            PresentationEngine::new(Box::new(|_, _, _| TransitionPlan::Transition(Vec::new())));
+        let pipeline = SlicePipeline::new(
+            engine,
+            std::time::Duration::ZERO,
+            None,
+            IdlePolicy::Blank,
+            0,
+        );
         let backend = BackendKind::Fifo(Box::new(FakeFifo {
             caps: caps(4_096),
             always_block: false,
@@ -607,7 +664,7 @@ mod tests {
             estimator: SoftwareDecayEstimator::new(),
         }));
         let (tx, rx) = mpsc::channel::<ControlMsg>();
-        let control = StreamControl::new(tx, Duration::ZERO, PPS);
+        let control = SessionControl::new(tx, Duration::ZERO, PPS);
         let metrics = FrameSessionMetrics::new(true);
         (backend, pipeline, control, rx, metrics)
     }
@@ -619,7 +676,7 @@ mod tests {
     fn pacing_sleep_uses_injected_clock_not_wall_clock() {
         let (mut backend, mut pipeline, control, rx, metrics) = sleep_scaffold();
         let clock = FakeClock::new();
-        let mut shutter = true;
+        let mut shutter = crate::presentation::output_model::ShutterState::Open;
 
         let wall_start = Instant::now();
         {
@@ -657,7 +714,7 @@ mod tests {
     fn pacing_sleep_returns_stopped_on_stop_request() {
         let (mut backend, mut pipeline, control, rx, metrics) = sleep_scaffold();
         let clock = FakeClock::new();
-        let mut shutter = true;
+        let mut shutter = crate::presentation::output_model::ShutterState::Open;
         control.stop().unwrap();
 
         let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);

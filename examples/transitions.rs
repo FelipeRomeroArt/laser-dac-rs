@@ -74,8 +74,10 @@ fn main() -> Result<()> {
     let device = open_device(&device_info.id)?;
 
     let transition_fn: TransitionFn = match args.mode {
-        Mode::Default | Mode::Animated => default_transition(30_000),
-        Mode::None => Box::new(|_: &LaserPoint, _: &LaserPoint| TransitionPlan::Transition(vec![])),
+        Mode::Default | Mode::Animated => default_transition(),
+        Mode::None => {
+            Box::new(|_: &LaserPoint, _: &LaserPoint, _| TransitionPlan::Transition(vec![]))
+        }
     };
 
     let config = FrameSessionConfig::new(30_000)

@@ -12,7 +12,7 @@ use crate::backend::BackendKind;
 use crate::buffer_estimate::BufferEstimator;
 use crate::device::DacInfo;
 use crate::error::Error;
-use crate::stream::{ControlMsg, StreamControl};
+use crate::session::{ControlMsg, SessionControl};
 
 use super::content_source::ContentSourceKind;
 use super::session::FrameSessionMetrics;
@@ -25,8 +25,16 @@ mod usb_frame_swap;
 /// One step's outcome.
 pub(crate) enum StepOutcome {
     Continue,
+    StateChanged,
     Stopped,
     Disconnected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ControlAction {
+    None,
+    StateChanged,
+    Stop,
 }
 
 /// Injectable time source for the driver loop's pacing sleeps.
@@ -96,14 +104,25 @@ impl Clock for FakeClock {
     }
 }
 
+/// Driver knowledge of the physical shutter after the last command.
+///
+/// An error cannot prove which state hardware reached, so failures always
+/// produce `Unknown` and safety-closing paths retry until closure is confirmed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShutterState {
+    Open,
+    Closed,
+    Unknown,
+}
+
 /// Shared context borrowed by the adapter for one `step`.
 pub(crate) struct LoopCtx<'a> {
     pub backend: &'a mut BackendKind,
     pub source: ContentSourceKind<'a>,
-    pub control: &'a StreamControl,
+    pub control: &'a SessionControl,
     pub control_rx: &'a mpsc::Receiver<ControlMsg>,
     pub metrics: &'a FrameSessionMetrics,
-    pub shutter_open: &'a mut bool,
+    pub shutter_open: &'a mut ShutterState,
     pub error_sink: &'a mut dyn FnMut(Error),
     pub target_buffer: Duration,
     pub pps: u32,
@@ -134,8 +153,11 @@ impl<'a> LoopCtx<'a> {
             if self.control.is_stop_requested() {
                 return Err(StepOutcome::Stopped);
             }
-            if process_control_messages(self.control_rx, self.shutter_open, self.backend) {
-                return Err(StepOutcome::Stopped);
+            close_if_disarmed(self.control, self.shutter_open, self.backend);
+            match process_control_messages(self.control_rx) {
+                ControlAction::Stop => return Err(StepOutcome::Stopped),
+                ControlAction::StateChanged => return Err(StepOutcome::StateChanged),
+                ControlAction::None => {}
             }
         }
     }
@@ -183,8 +205,11 @@ impl<'a> LoopCtx<'a> {
             if self.control.is_stop_requested() {
                 return Err(StepOutcome::Stopped);
             }
-            if process_control_messages(self.control_rx, self.shutter_open, self.backend) {
-                return Err(StepOutcome::Stopped);
+            close_if_disarmed(self.control, self.shutter_open, self.backend);
+            match process_control_messages(self.control_rx) {
+                ControlAction::Stop => return Err(StepOutcome::Stopped),
+                ControlAction::StateChanged => return Err(StepOutcome::StateChanged),
+                ControlAction::None => {}
             }
         }
     }
@@ -195,35 +220,33 @@ impl<'a> LoopCtx<'a> {
     }
 }
 
-/// Drain the control-message channel, applying arm/disarm shutter side effects.
-/// Returns `true` if a stop was requested.
-pub(crate) fn process_control_messages(
-    control_rx: &mpsc::Receiver<ControlMsg>,
-    shutter_open: &mut bool,
-    backend: &mut BackendKind,
-) -> bool {
+/// Drain scheduler notifications. Desired atomic state remains authoritative;
+/// arm/disarm messages never command hardware directly. Stop wins the drain.
+pub(crate) fn process_control_messages(control_rx: &mpsc::Receiver<ControlMsg>) -> ControlAction {
     use std::sync::mpsc::TryRecvError;
+    let mut action = ControlAction::None;
     loop {
         match control_rx.try_recv() {
-            Ok(ControlMsg::Arm) => {
-                if !*shutter_open {
-                    let _ = backend.set_shutter(true);
-                    *shutter_open = true;
-                }
-            }
-            Ok(ControlMsg::Disarm) => {
-                if *shutter_open {
-                    let _ = backend.set_shutter(false);
-                    *shutter_open = false;
-                }
-            }
-            Ok(ControlMsg::Stop) => {
-                return true;
-            }
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            Ok(ControlMsg::Arm | ControlMsg::Disarm) => action = ControlAction::StateChanged,
+            Ok(ControlMsg::Stop) => return ControlAction::Stop,
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => return action,
         }
     }
-    false
+}
+
+/// During waits and retained-write retries, only the safety-closing direction
+/// may touch the shutter. Opening is exclusively owned by the shared driver.
+pub(crate) fn close_if_disarmed(
+    control: &SessionControl,
+    shutter_state: &mut ShutterState,
+    backend: &mut BackendKind,
+) {
+    if !control.is_armed() && *shutter_state != ShutterState::Closed {
+        *shutter_state = match backend.set_shutter(false) {
+            Ok(()) => ShutterState::Closed,
+            Err(_) => ShutterState::Unknown,
+        };
+    }
 }
 
 /// One per [`OutputModel`](crate::device::OutputModel) variant.
@@ -236,6 +259,9 @@ pub(crate) trait OutputModelAdapter: Send {
     /// reset (re-pending the last frame, resetting buffers, frame capacity)
     /// is performed by the driver against the `ContentSource` separately.
     fn on_reconnect(&mut self, info: &DacInfo, backend: &mut BackendKind);
+
+    /// Clear adapter-owned retain state on an observed arm/disarm edge.
+    fn on_state_change(&mut self, _armed: bool) {}
 
     /// Wait for queued points to drain, then output a small blank chunk and
     /// close the shutter. Called by the driver on graceful end-of-stream.
@@ -251,8 +277,10 @@ pub(crate) trait OutputModelAdapter: Send {
 /// shutdown shared between drain paths.
 pub(crate) fn blank_and_close_shutter(ctx: &mut LoopCtx<'_>) {
     use crate::point::LaserPoint;
-    let _ = ctx.backend.set_shutter(false);
-    *ctx.shutter_open = false;
+    *ctx.shutter_open = match ctx.backend.set_shutter(false) {
+        Ok(()) => ShutterState::Closed,
+        Err(_) => ShutterState::Unknown,
+    };
     let blank = [LaserPoint::blanked(0.0, 0.0); 16];
     let _ = ctx.backend.try_write(ctx.pps, &blank);
 }
@@ -308,7 +336,11 @@ pub(crate) fn drain_via_estimator(ctx: &mut LoopCtx<'_>, timeout: Duration) {
         if ctx.control.is_stop_requested() {
             break;
         }
-        if process_control_messages(ctx.control_rx, ctx.shutter_open, ctx.backend) {
+        close_if_disarmed(ctx.control, ctx.shutter_open, ctx.backend);
+        if !matches!(
+            process_control_messages(ctx.control_rx),
+            ControlAction::None
+        ) {
             break;
         }
         ctx.clock.sleep(POLL);

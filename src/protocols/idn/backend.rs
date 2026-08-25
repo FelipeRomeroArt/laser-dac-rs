@@ -242,10 +242,10 @@ impl IdnBackend {
     }
 
     /// Convert `points` into the selected wire format, reusing a pooled buffer
-    /// when one is available, and clamp `pps` to the device's maximum rate.
-    /// Runtime rate changes (`StreamControl::set_pps`) bypass start-of-stream
-    /// validation, so this is the last checkpoint before a rate reaches
-    /// hardware (mirroring the other backends' clamping).
+    /// when one is available, and defensively clamp `pps` to the device's
+    /// maximum rate. [`SessionControl::set_pps`](crate::SessionControl::set_pps)
+    /// validates runtime changes; this backend boundary remains a final guard
+    /// for direct/internal callers (mirroring the other backends' clamping).
     fn build_chunk(&self, pps: u32, points: &[LaserPoint]) -> QueuedChunk {
         let pps = pps.min(self.caps.pps_max);
         let chunk_points = match self.point_format {
@@ -763,9 +763,9 @@ mod tests {
         super::IdnBackend::new(server, service)
     }
 
-    /// Runtime `set_pps` bypasses start-of-stream validation, so chunk
-    /// construction is the last checkpoint: an out-of-range rate must never
-    /// reach the worker (and from there the device).
+    /// Chunk construction remains a defensive final checkpoint: an
+    /// out-of-range rate supplied directly to the backend must never reach the
+    /// worker (and from there the device).
     #[test]
     fn build_chunk_clamps_pps_to_device_maximum() {
         let backend = test_backend();

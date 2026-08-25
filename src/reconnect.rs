@@ -15,7 +15,8 @@ use crate::backend::{BackendKind, Error, Result};
 use crate::config::ReconnectConfig;
 use crate::device::{DacInfo, EnabledDacTypes};
 use crate::discovery::DacDiscovery;
-use crate::stream::{Dac, RunExit};
+use crate::session::SessionExit;
+use crate::stream::Dac;
 
 type DisconnectCallback = Box<dyn FnMut(&Error) + Send + 'static>;
 type ReconnectCallback = Box<dyn FnMut(&DacInfo) + Send + 'static>;
@@ -126,10 +127,10 @@ pub(crate) fn reconnect_backend_with_retry<FStop, FValidate, FProgress>(
     is_stopped: FStop,
     validate: FValidate,
     mut on_progress: FProgress,
-) -> std::result::Result<(DacInfo, BackendKind), RunExit>
+) -> std::result::Result<(DacInfo, BackendKind), SessionExit>
 where
     FStop: Fn() -> bool,
-    FValidate: Fn(&DacInfo, &BackendKind) -> std::result::Result<(), RunExit>,
+    FValidate: Fn(&DacInfo, &BackendKind) -> std::result::Result<(), SessionExit>,
     FProgress: FnMut(),
 {
     // Crate poisoning policy: user callbacks are invoked without holding any
@@ -159,12 +160,12 @@ where
     loop {
         on_progress();
         if is_stopped() {
-            return Err(RunExit::Stopped);
+            return Err(SessionExit::Stopped);
         }
 
         if let Some(max) = policy.max_retries {
             if retries >= max {
-                return Err(RunExit::Disconnected);
+                return Err(SessionExit::Disconnected);
             }
         }
 
@@ -176,7 +177,7 @@ where
         if (retries > 0 || flapping)
             && ReconnectPolicy::sleep_with_stop(policy.backoff, &is_stopped, &mut on_progress)
         {
-            return Err(RunExit::Stopped);
+            return Err(SessionExit::Stopped);
         }
 
         on_progress();
@@ -191,7 +192,7 @@ where
             Err(err) => {
                 if !ReconnectPolicy::is_retriable(&err) {
                     log::error!("'{}' non-retriable error: {}", policy.target.device_id, err);
-                    return Err(RunExit::Disconnected);
+                    return Err(SessionExit::Disconnected);
                 }
                 log::warn!("'{}' open_device failed: {}", policy.target.device_id, err);
                 retries = retries.saturating_add(1);
@@ -199,7 +200,7 @@ where
             }
         };
 
-        let info = device.info().clone();
+        let mut info = device.info().clone();
         let mut backend = match device.into_backend() {
             Some(b) => b,
             None => {
@@ -208,21 +209,55 @@ where
             }
         };
 
-        validate(&info, &backend)?;
+        if let Err(exit) = validate(&info, &backend) {
+            // A discoverer may hand back an already-connected backend. Never
+            // reject it without first making a best-effort safe handoff.
+            backend.close_and_disconnect();
+            return Err(exit);
+        }
 
         if !backend.is_connected() {
             match backend.connect() {
                 Ok(()) => {}
                 Err(err) => {
+                    // A failed connect does not prove the transport stayed
+                    // disconnected or that output remained disabled.
+                    backend.close_and_disconnect();
                     if !ReconnectPolicy::is_retriable(&err) {
                         log::error!("'{}' non-retriable error: {}", policy.target.device_id, err);
-                        return Err(RunExit::Disconnected);
+                        return Err(SessionExit::Disconnected);
                     }
                     log::warn!("'{}' connect failed: {}", policy.target.device_id, err);
                     retries = retries.saturating_add(1);
                     continue;
                 }
             }
+        }
+
+        // Some devices (notably LaserCube USB) enable output as a side effect
+        // of connecting. Closure is part of establishing a usable connection,
+        // and a failed close is retried like any other transport failure.
+        if let Err(err) = backend.set_shutter(false) {
+            log::warn!(
+                "'{}' initial shutter close failed: {}",
+                policy.target.device_id,
+                err
+            );
+            backend.close_and_disconnect();
+            retries = retries.saturating_add(1);
+            continue;
+        }
+
+        // Connect may discover tighter live capabilities or even a different
+        // live output model than scanning did. Refresh the public snapshot and
+        // rerun the same validator before accepting the connected backend.
+        info.caps = backend.caps().clone();
+        if let Err(exit) = validate(&info, &backend) {
+            // Repeat closure as part of the rejected-backend teardown; a
+            // successful earlier command is not a substitute for explicitly
+            // handing the rejected connection back in a safe state.
+            backend.close_and_disconnect();
+            return Err(exit);
         }
 
         log::info!("'{}' reconnected successfully", policy.target.device_id);
@@ -318,13 +353,30 @@ mod tests {
     struct MockFifo {
         connected: bool,
         estimator: SoftwareDecayEstimator,
+        shutter_close_count: Arc<AtomicUsize>,
+        disconnect_count: Arc<AtomicUsize>,
+        caps: DacCapabilities,
+        live_pps_max: Option<u32>,
     }
 
     impl MockFifo {
-        fn new() -> Self {
+        fn new(
+            shutter_close_count: Arc<AtomicUsize>,
+            disconnect_count: Arc<AtomicUsize>,
+            live_pps_max: Option<u32>,
+        ) -> Self {
             Self {
                 connected: false,
                 estimator: SoftwareDecayEstimator::new(),
+                shutter_close_count,
+                disconnect_count,
+                caps: DacCapabilities {
+                    pps_min: 1000,
+                    pps_max: 100_000,
+                    max_points_per_chunk: 1000,
+                    output_model: OutputModel::NetworkFifo,
+                },
+                live_pps_max,
             }
         }
     }
@@ -334,20 +386,18 @@ mod tests {
             DacType::Custom("ReconMock".into())
         }
         fn caps(&self) -> &DacCapabilities {
-            static CAPS: DacCapabilities = DacCapabilities {
-                pps_min: 1000,
-                pps_max: 100_000,
-                max_points_per_chunk: 1000,
-                output_model: OutputModel::NetworkFifo,
-            };
-            &CAPS
+            &self.caps
         }
         fn connect(&mut self) -> Result<()> {
             self.connected = true;
+            if let Some(max) = self.live_pps_max {
+                self.caps.pps_max = max;
+            }
             Ok(())
         }
         fn disconnect(&mut self) -> Result<()> {
             self.connected = false;
+            self.disconnect_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         fn is_connected(&self) -> bool {
@@ -356,7 +406,10 @@ mod tests {
         fn stop(&mut self) -> Result<()> {
             Ok(())
         }
-        fn set_shutter(&mut self, _open: bool) -> Result<()> {
+        fn set_shutter(&mut self, open: bool) -> Result<()> {
+            if !open {
+                self.shutter_close_count.fetch_add(1, Ordering::SeqCst);
+            }
             Ok(())
         }
     }
@@ -373,6 +426,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum ConnectBehavior {
         Ok,
+        LivePpsMax(u32),
         InvalidConfig,
     }
 
@@ -380,6 +434,8 @@ mod tests {
         return_device: bool,
         connect: ConnectBehavior,
         connect_count: Arc<AtomicUsize>,
+        shutter_close_count: Arc<AtomicUsize>,
+        disconnect_count: Arc<AtomicUsize>,
     }
 
     impl Discoverer for ReconMockDiscoverer {
@@ -403,7 +459,16 @@ mod tests {
         fn connect(&mut self, _opaque: Box<dyn std::any::Any + Send>) -> Result<BackendKind> {
             self.connect_count.fetch_add(1, Ordering::SeqCst);
             match self.connect {
-                ConnectBehavior::Ok => Ok(BackendKind::Fifo(Box::new(MockFifo::new()))),
+                ConnectBehavior::Ok => Ok(BackendKind::Fifo(Box::new(MockFifo::new(
+                    self.shutter_close_count.clone(),
+                    self.disconnect_count.clone(),
+                    None,
+                )))),
+                ConnectBehavior::LivePpsMax(max) => Ok(BackendKind::Fifo(Box::new(MockFifo::new(
+                    self.shutter_close_count.clone(),
+                    self.disconnect_count.clone(),
+                    Some(max),
+                )))),
                 ConnectBehavior::InvalidConfig => Err(Error::invalid_config("mock connect reject")),
             }
         }
@@ -415,13 +480,19 @@ mod tests {
         return_device: bool,
         connect_behavior: ConnectBehavior,
         connect_count: Arc<AtomicUsize>,
-    ) -> ReconnectPolicy {
+    ) -> (ReconnectPolicy, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let shutter_close_count = Arc::new(AtomicUsize::new(0));
+        let disconnect_count = Arc::new(AtomicUsize::new(0));
+        let factory_close_count = shutter_close_count.clone();
+        let factory_disconnect_count = disconnect_count.clone();
         let factory = move || {
             let mut d = DacDiscovery::new(EnabledDacTypes::none());
             d.register(Box::new(ReconMockDiscoverer {
                 return_device,
                 connect: connect_behavior,
                 connect_count: connect_count.clone(),
+                shutter_close_count: factory_close_count.clone(),
+                disconnect_count: factory_disconnect_count.clone(),
             }));
             d
         };
@@ -429,10 +500,14 @@ mod tests {
             device_id: MOCK_ID.to_string(),
             discovery_factory: Some(Box::new(factory)),
         };
-        ReconnectPolicy::new(config, target)
+        (
+            ReconnectPolicy::new(config, target),
+            shutter_close_count,
+            disconnect_count,
+        )
     }
 
-    fn accept(_info: &DacInfo, _backend: &BackendKind) -> std::result::Result<(), RunExit> {
+    fn accept(_info: &DacInfo, _backend: &BackendKind) -> std::result::Result<(), SessionExit> {
         Ok(())
     }
 
@@ -448,7 +523,8 @@ mod tests {
             .backoff(Duration::from_millis(1))
             .on_disconnect(move |_err| disconnected_cb.store(true, Ordering::SeqCst));
         let connect_count = Arc::new(AtomicUsize::new(0));
-        let policy = make_policy(config, true, ConnectBehavior::Ok, connect_count.clone());
+        let (policy, shutter_close_count, _disconnect_count) =
+            make_policy(config, true, ConnectBehavior::Ok, connect_count.clone());
 
         let result = reconnect_backend_with_retry(&policy, None, || false, accept, || {});
 
@@ -463,6 +539,11 @@ mod tests {
             "on_disconnect callback should fire once at the start"
         );
         assert_eq!(connect_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            shutter_close_count.load(Ordering::SeqCst),
+            1,
+            "reconnect must confirm shutter closure before returning"
+        );
     }
 
     #[test]
@@ -472,10 +553,11 @@ mod tests {
             .max_retries(2)
             .backoff(Duration::from_millis(1));
         let connect_count = Arc::new(AtomicUsize::new(0));
-        let policy = make_policy(config, false, ConnectBehavior::Ok, connect_count.clone());
+        let (policy, _shutter_close_count, _disconnect_count) =
+            make_policy(config, false, ConnectBehavior::Ok, connect_count.clone());
 
         let result = reconnect_backend_with_retry(&policy, None, || false, accept, || {});
-        assert_eq!(result.err(), Some(RunExit::Disconnected));
+        assert_eq!(result.err(), Some(SessionExit::Disconnected));
         assert_eq!(
             connect_count.load(Ordering::SeqCst),
             0,
@@ -496,11 +578,12 @@ mod tests {
 
         let config = ReconnectConfig::new().backoff(Duration::from_millis(20));
         let connect_count = Arc::new(AtomicUsize::new(0));
-        let policy = make_policy(config, true, ConnectBehavior::Ok, connect_count.clone());
+        let (policy, _shutter_close_count, _disconnect_count) =
+            make_policy(config, true, ConnectBehavior::Ok, connect_count.clone());
 
         let result =
             reconnect_backend_with_retry(&policy, Some(Instant::now()), is_stopped, accept, || {});
-        assert_eq!(result.err(), Some(RunExit::Stopped));
+        assert_eq!(result.err(), Some(SessionExit::Stopped));
         assert_eq!(
             connect_count.load(Ordering::SeqCst),
             0,
@@ -513,7 +596,7 @@ mod tests {
         // Device is discoverable but connect() returns a non-retriable config error.
         let config = ReconnectConfig::new().backoff(Duration::from_millis(1));
         let connect_count = Arc::new(AtomicUsize::new(0));
-        let policy = make_policy(
+        let (policy, _shutter_close_count, _disconnect_count) = make_policy(
             config,
             true,
             ConnectBehavior::InvalidConfig,
@@ -521,7 +604,7 @@ mod tests {
         );
 
         let result = reconnect_backend_with_retry(&policy, None, || false, accept, || {});
-        assert_eq!(result.err(), Some(RunExit::Disconnected));
+        assert_eq!(result.err(), Some(SessionExit::Disconnected));
         assert_eq!(
             connect_count.load(Ordering::SeqCst),
             1,
@@ -530,20 +613,60 @@ mod tests {
     }
 
     #[test]
+    fn retry_revalidates_tightened_live_caps_after_connect() {
+        let config = ReconnectConfig::new().backoff(Duration::from_millis(1));
+        let connect_count = Arc::new(AtomicUsize::new(0));
+        let (policy, shutter_close_count, disconnect_count) = make_policy(
+            config,
+            true,
+            ConnectBehavior::LivePpsMax(20_000),
+            connect_count.clone(),
+        );
+
+        let validations = Arc::new(AtomicUsize::new(0));
+        let validations_cb = validations.clone();
+        let validate = move |info: &DacInfo, backend: &BackendKind| {
+            validations_cb.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(info.caps.pps_max, backend.caps().pps_max);
+            if backend.caps().pps_max < 30_000 {
+                Err(SessionExit::Disconnected)
+            } else {
+                Ok(())
+            }
+        };
+
+        let result = reconnect_backend_with_retry(&policy, None, || false, validate, || {});
+        assert_eq!(result.err(), Some(SessionExit::Disconnected));
+        assert_eq!(validations.load(Ordering::SeqCst), 2);
+        assert_eq!(connect_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            shutter_close_count.load(Ordering::SeqCst),
+            2,
+            "live-cap rejection must repeat closure during explicit teardown"
+        );
+        assert_eq!(
+            disconnect_count.load(Ordering::SeqCst),
+            1,
+            "a live-cap-rejected backend must be disconnected"
+        );
+    }
+
+    #[test]
     fn retry_validate_rejection_propagates() {
         let config = ReconnectConfig::new().backoff(Duration::from_millis(1));
         let connect_count = Arc::new(AtomicUsize::new(0));
-        let policy = make_policy(config, true, ConnectBehavior::Ok, connect_count.clone());
+        let (policy, _shutter_close_count, _disconnect_count) =
+            make_policy(config, true, ConnectBehavior::Ok, connect_count.clone());
 
         let validated = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let validated_cb = validated.clone();
         let reject = move |_info: &DacInfo, _backend: &BackendKind| {
             validated_cb.store(true, Ordering::SeqCst);
-            Err(RunExit::Disconnected)
+            Err(SessionExit::Disconnected)
         };
 
         let result = reconnect_backend_with_retry(&policy, None, || false, reject, || {});
-        assert_eq!(result.err(), Some(RunExit::Disconnected));
+        assert_eq!(result.err(), Some(SessionExit::Disconnected));
         assert!(
             validated.load(Ordering::SeqCst),
             "validate closure should have run on the opened device"

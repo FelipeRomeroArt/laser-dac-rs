@@ -32,7 +32,9 @@ impl UsbFrameSwapAdapter {
 impl OutputModelAdapter for UsbFrameSwapAdapter {
     fn step(&mut self, ctx: &mut LoopCtx<'_>) -> StepOutcome {
         if !ctx.backend.is_ready_for_frame() {
-            ctx.sleep_and_mark_activity(Duration::from_millis(1));
+            if let Err(outcome) = ctx.sleep_with_control_check(Duration::from_millis(1)) {
+                return outcome;
+            }
             return StepOutcome::Continue;
         }
 
@@ -134,6 +136,11 @@ impl OutputModelAdapter for UsbFrameSwapAdapter {
         self.write_pending = false;
         self.transient_retries = 0;
     }
+
+    fn on_state_change(&mut self, _armed: bool) {
+        self.write_pending = false;
+        self.transient_retries = 0;
+    }
 }
 
 #[cfg(test)]
@@ -155,7 +162,7 @@ mod tests {
     use crate::presentation::session::FrameSessionMetrics;
     use crate::presentation::slice_pipeline::SlicePipeline;
     use crate::presentation::{Frame, TransitionPlan};
-    use crate::stream::{ControlMsg, StreamControl};
+    use crate::session::{ControlMsg, SessionControl};
 
     use super::{UsbFrameSwapAdapter, MAX_TRANSIENT_WRITE_RETRIES};
 
@@ -235,20 +242,26 @@ mod tests {
         let mut backend = BackendKind::FrameSwap(Box::new(backend));
 
         let mut engine =
-            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+            PresentationEngine::new(Box::new(|_, _, _| TransitionPlan::Transition(Vec::new())));
         engine.set_frame_capacity(Some(4_095));
         let pts: Vec<LaserPoint> = (0..16)
             .map(|i| LaserPoint::new(i as f32 * 0.01, 0.0, 1000, 1000, 1000, 1000))
             .collect();
         engine.set_pending(Frame::new(pts));
-        let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+        let mut pipeline = SlicePipeline::new(
+            engine,
+            std::time::Duration::ZERO,
+            None,
+            IdlePolicy::Blank,
+            0,
+        );
 
         let mut adapter = UsbFrameSwapAdapter::new(&backend);
 
         let (tx, rx) = mpsc::channel::<ControlMsg>();
-        let control = StreamControl::new(tx, std::time::Duration::ZERO, 30_000);
+        let control = SessionControl::new(tx, std::time::Duration::ZERO, 30_000);
         let metrics = FrameSessionMetrics::new(true);
-        let mut shutter = false;
+        let mut shutter = crate::presentation::output_model::ShutterState::Closed;
 
         // Step 1: not ready → 1ms sleep, no produce/write.
         {
@@ -323,19 +336,25 @@ mod tests {
         let mut backend = BackendKind::FrameSwap(Box::new(backend));
 
         let mut engine =
-            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+            PresentationEngine::new(Box::new(|_, _, _| TransitionPlan::Transition(Vec::new())));
         engine.set_frame_capacity(Some(4_095));
         let pts: Vec<LaserPoint> = (0..16)
             .map(|i| LaserPoint::new(i as f32 * 0.01, 0.0, 1000, 1000, 1000, 1000))
             .collect();
         engine.set_pending(Frame::new(pts));
-        let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+        let mut pipeline = SlicePipeline::new(
+            engine,
+            std::time::Duration::ZERO,
+            None,
+            IdlePolicy::Blank,
+            0,
+        );
 
         let mut adapter = UsbFrameSwapAdapter::new(&backend);
         let (tx, rx) = mpsc::channel::<ControlMsg>();
-        let control = StreamControl::new(tx, std::time::Duration::ZERO, 30_000);
+        let control = SessionControl::new(tx, std::time::Duration::ZERO, 30_000);
         let metrics = FrameSessionMetrics::new(true);
-        let mut shutter = false;
+        let mut shutter = crate::presentation::output_model::ShutterState::Closed;
 
         {
             let source = ContentSourceKind::Frame(&mut pipeline as &mut dyn FrameContentSource);
@@ -388,14 +407,19 @@ mod tests {
                 shutter_open: &mut shutter,
                 error_sink: &mut |_| {},
                 target_buffer: std::time::Duration::from_millis(20),
-                pps: 30_000,
+                pps: 60_000,
                 is_armed: true,
                 clock: &SystemClock,
             };
             assert!(matches!(adapter.step(&mut ctx), StepOutcome::Continue));
         }
 
-        assert_eq!(writes.lock().unwrap().len(), 2);
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(
+            writes[0], writes[1],
+            "a PPS change must not mutate an in-flight WouldBlock retry"
+        );
         assert!(pipeline.cached_slice().is_none());
         assert_eq!(ready_checks.load(Ordering::SeqCst), 3);
     }
@@ -436,19 +460,25 @@ mod tests {
         );
 
         let mut engine =
-            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+            PresentationEngine::new(Box::new(|_, _, _| TransitionPlan::Transition(Vec::new())));
         engine.set_frame_capacity(Some(4_095));
         let pts: Vec<LaserPoint> = (0..16)
             .map(|i| LaserPoint::new(i as f32 * 0.01, 0.0, 1000, 1000, 1000, 1000))
             .collect();
         engine.set_pending(Frame::new(pts));
-        let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+        let mut pipeline = SlicePipeline::new(
+            engine,
+            std::time::Duration::ZERO,
+            None,
+            IdlePolicy::Blank,
+            0,
+        );
 
         let mut adapter = UsbFrameSwapAdapter::new(&backend);
         let (tx, rx) = mpsc::channel::<ControlMsg>();
-        let control = StreamControl::new(tx, std::time::Duration::ZERO, 30_000);
+        let control = SessionControl::new(tx, std::time::Duration::ZERO, 30_000);
         let metrics = FrameSessionMetrics::new(true);
-        let mut shutter = false;
+        let mut shutter = crate::presentation::output_model::ShutterState::Closed;
 
         // Step 1: transient error — retried, cached frame kept, no disconnect.
         {
@@ -510,19 +540,25 @@ mod tests {
             fake_ready_backend(outcomes, Arc::clone(&writes), Arc::clone(&disconnects));
 
         let mut engine =
-            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+            PresentationEngine::new(Box::new(|_, _, _| TransitionPlan::Transition(Vec::new())));
         engine.set_frame_capacity(Some(4_095));
         let pts: Vec<LaserPoint> = (0..16)
             .map(|i| LaserPoint::new(i as f32 * 0.01, 0.0, 1000, 1000, 1000, 1000))
             .collect();
         engine.set_pending(Frame::new(pts));
-        let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+        let mut pipeline = SlicePipeline::new(
+            engine,
+            std::time::Duration::ZERO,
+            None,
+            IdlePolicy::Blank,
+            0,
+        );
 
         let mut adapter = UsbFrameSwapAdapter::new(&backend);
         let (tx, rx) = mpsc::channel::<ControlMsg>();
-        let control = StreamControl::new(tx, std::time::Duration::ZERO, 30_000);
+        let control = SessionControl::new(tx, std::time::Duration::ZERO, 30_000);
         let metrics = FrameSessionMetrics::new(true);
-        let mut shutter = false;
+        let mut shutter = crate::presentation::output_model::ShutterState::Closed;
 
         let mut last = StepOutcome::Continue;
         for _ in 0..(MAX_TRANSIENT_WRITE_RETRIES + 1) {

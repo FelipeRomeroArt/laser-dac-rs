@@ -14,19 +14,16 @@ use crate::error::Error;
 use crate::point::LaserPoint;
 use crate::presentation::content_source::FifoContentSource;
 use crate::presentation::ColorDelayLine;
-use crate::presentation::{
-    blank_prefix, duration_micros_to_points, duration_to_points, park_point,
-};
-use crate::stream::{
-    ChunkRequest, ChunkResult, SharedStreamStats, StreamControl, StreamInstant, StreamStats,
-};
+use crate::presentation::{blank_prefix, duration_to_points, park_point};
+use crate::session::SessionControl;
+use crate::stream::{ChunkRequest, ChunkResult, SharedStreamStats, StreamInstant, StreamStats};
 
 type FillFn = Box<dyn FnMut(&ChunkRequest, &mut [LaserPoint]) -> ChunkResult + Send + 'static>;
 
 /// Wraps a user-supplied chunk-fill callback as a `FifoContentSource`.
 pub(crate) struct ChunkProducer {
     producer: FillFn,
-    control: StreamControl,
+    control: SessionControl,
     idle_policy: IdlePolicy,
     startup_blank: Duration,
 
@@ -69,7 +66,7 @@ pub(crate) struct ChunkProducer {
 impl ChunkProducer {
     pub fn new<F>(
         producer: F,
-        control: StreamControl,
+        control: SessionControl,
         idle_policy: IdlePolicy,
         startup_blank: Duration,
         initial_capacity: usize,
@@ -147,7 +144,7 @@ impl ChunkProducer {
         n: usize,
         pps: u32,
         is_armed: bool,
-        delay_micros: u64,
+        color_delay: Duration,
     ) {
         if !is_armed {
             let park = park_point(&self.idle_policy);
@@ -159,7 +156,7 @@ impl ChunkProducer {
         }
 
         self.color_delay_line
-            .resize(duration_micros_to_points(delay_micros, pps));
+            .resize(duration_to_points(color_delay, pps));
         self.color_delay_line.apply(&mut self.buf[..n]);
     }
 
@@ -212,7 +209,7 @@ impl FifoContentSource for ChunkProducer {
         self.ensure_buf(target_points);
 
         let req = self.build_request(target_points, pps);
-        let delay_micros = self.control.color_delay().as_micros() as u64;
+        let color_delay = self.control.color_delay();
 
         let result = match (self.producer)(&req, &mut self.buf[..target_points]) {
             ChunkResult::Filled(0) => ChunkResult::Starved,
@@ -255,7 +252,7 @@ impl FifoContentSource for ChunkProducer {
         self.pending_raw[..n].copy_from_slice(&self.buf[..n]);
         self.pending_raw_len = n;
 
-        self.apply_blanking_and_color_delay(n, pps, is_armed, delay_micros);
+        self.apply_blanking_and_color_delay(n, pps, is_armed, color_delay);
 
         self.cached_len = n;
         self.cached = true;
@@ -334,12 +331,12 @@ mod tests {
         LaserPoint::new(x, 0.0, 1000, 1000, 1000, 1000)
     }
 
-    fn make_producer<F>(producer: F, idle: IdlePolicy) -> (ChunkProducer, StreamControl)
+    fn make_producer<F>(producer: F, idle: IdlePolicy) -> (ChunkProducer, SessionControl)
     where
         F: FnMut(&ChunkRequest, &mut [LaserPoint]) -> ChunkResult + Send + 'static,
     {
         let (tx, _rx) = mpsc::channel();
-        let control = StreamControl::new(tx, Duration::ZERO, 30_000);
+        let control = SessionControl::new(tx, Duration::ZERO, 30_000);
         let cp = ChunkProducer::new(
             producer,
             control.clone(),
@@ -359,12 +356,12 @@ mod tests {
         color_delay: Duration,
         startup_blank: Duration,
         pps: u32,
-    ) -> (ChunkProducer, StreamControl)
+    ) -> (ChunkProducer, SessionControl)
     where
         F: FnMut(&ChunkRequest, &mut [LaserPoint]) -> ChunkResult + Send + 'static,
     {
         let (tx, _rx) = mpsc::channel();
-        let control = StreamControl::new(tx, color_delay, pps);
+        let control = SessionControl::new(tx, color_delay, pps);
         let cp = ChunkProducer::new(
             producer,
             control.clone(),
@@ -583,12 +580,12 @@ mod tests {
         color_delay: Duration,
         pps: u32,
         idle: IdlePolicy,
-    ) -> (ChunkProducer, StreamControl)
+    ) -> (ChunkProducer, SessionControl)
     where
         F: FnMut(&ChunkRequest, &mut [LaserPoint]) -> ChunkResult + Send + 'static,
     {
         let (tx, _rx) = mpsc::channel();
-        let control = StreamControl::new(tx, color_delay, pps);
+        let control = SessionControl::new(tx, color_delay, pps);
         let cp = ChunkProducer::new(
             producer,
             control.clone(),

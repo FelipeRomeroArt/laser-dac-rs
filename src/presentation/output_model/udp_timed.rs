@@ -144,6 +144,10 @@ impl OutputModelAdapter for UdpTimedAdapter {
         self.chunk_points = 0;
     }
 
+    fn on_state_change(&mut self, _armed: bool) {
+        self.has_retain = false;
+    }
+
     fn drain_and_blank(&mut self, ctx: &mut LoopCtx<'_>, timeout: Duration) {
         drain_via_estimator(ctx, timeout);
         blank_and_close_shutter(ctx);
@@ -169,7 +173,7 @@ mod tests {
     use crate::presentation::session::FrameSessionMetrics;
     use crate::presentation::slice_pipeline::SlicePipeline;
     use crate::presentation::{Frame, TransitionPlan};
-    use crate::stream::{ControlMsg, StreamControl};
+    use crate::session::{ControlMsg, SessionControl};
 
     use super::UdpTimedAdapter;
 
@@ -244,9 +248,15 @@ mod tests {
         let expected_initial_chunk = 200;
 
         let mut engine =
-            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+            PresentationEngine::new(Box::new(|_, _, _| TransitionPlan::Transition(Vec::new())));
         engine.set_pending(frame_with_points(400));
-        let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+        let mut pipeline = SlicePipeline::new(
+            engine,
+            std::time::Duration::ZERO,
+            None,
+            IdlePolicy::Blank,
+            0,
+        );
 
         let outcomes = Arc::new(Mutex::new(vec![WriteOutcome::WouldBlock]));
         let writes = Arc::new(Mutex::new(Vec::new()));
@@ -265,9 +275,9 @@ mod tests {
         let mut adapter = UdpTimedAdapter::new(&backend);
 
         let (tx, rx) = mpsc::channel::<ControlMsg>();
-        let control = StreamControl::new(tx, std::time::Duration::ZERO, PPS_INITIAL);
+        let control = SessionControl::new(tx, std::time::Duration::ZERO, PPS_INITIAL);
         let metrics = FrameSessionMetrics::new(true);
-        let mut shutter = false;
+        let mut shutter = crate::presentation::output_model::ShutterState::Closed;
 
         {
             let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
@@ -295,7 +305,7 @@ mod tests {
         );
 
         // Drop pps so a fresh produce would yield a smaller chunk; queue Written next.
-        control.set_pps(PPS_AFTER);
+        control.set_pps(PPS_AFTER).unwrap();
         {
             let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
             let mut ctx = LoopCtx {
@@ -365,9 +375,15 @@ mod tests {
     #[test]
     fn stall_allows_bounded_catchup() {
         let mut engine =
-            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+            PresentationEngine::new(Box::new(|_, _, _| TransitionPlan::Transition(Vec::new())));
         engine.set_pending(frame_with_points(4_000));
-        let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+        let mut pipeline = SlicePipeline::new(
+            engine,
+            std::time::Duration::ZERO,
+            None,
+            IdlePolicy::Blank,
+            0,
+        );
 
         let backend = FakeFifo {
             caps: DacCapabilities {
@@ -387,9 +403,9 @@ mod tests {
         adapter.next_send = std::time::Instant::now() - std::time::Duration::from_secs(1);
 
         let (tx, rx) = mpsc::channel::<ControlMsg>();
-        let control = StreamControl::new(tx, std::time::Duration::ZERO, 30_000);
+        let control = SessionControl::new(tx, std::time::Duration::ZERO, 30_000);
         let metrics = FrameSessionMetrics::new(true);
-        let mut shutter = false;
+        let mut shutter = crate::presentation::output_model::ShutterState::Closed;
         {
             let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
             let mut ctx = LoopCtx {
@@ -441,9 +457,15 @@ mod tests {
             (60_000, 4_096, 600),
         ] {
             let mut engine =
-                PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+                PresentationEngine::new(Box::new(|_, _, _| TransitionPlan::Transition(Vec::new())));
             engine.set_pending(frame_with_points(8_000));
-            let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+            let mut pipeline = SlicePipeline::new(
+                engine,
+                std::time::Duration::ZERO,
+                None,
+                IdlePolicy::Blank,
+                0,
+            );
 
             let writes = Arc::new(Mutex::new(Vec::new()));
             let backend = FakeFifo {
@@ -461,9 +483,9 @@ mod tests {
             let mut adapter = UdpTimedAdapter::new(&backend);
 
             let (tx, rx) = mpsc::channel::<ControlMsg>();
-            let control = StreamControl::new(tx, std::time::Duration::ZERO, pps);
+            let control = SessionControl::new(tx, std::time::Duration::ZERO, pps);
             let metrics = FrameSessionMetrics::new(true);
-            let mut shutter = false;
+            let mut shutter = crate::presentation::output_model::ShutterState::Closed;
 
             // Two steps so the second produces a fresh chunk after the first
             // commits its retain.

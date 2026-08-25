@@ -16,7 +16,7 @@ pub enum Error {
     /// The device/library cannot accept more data right now.
     WouldBlock,
 
-    /// The stream was explicitly stopped via `StreamControl::stop()`.
+    /// The stream was explicitly stopped via `SessionControl::stop()`.
     Stopped,
 
     /// The device disconnected or became unreachable.

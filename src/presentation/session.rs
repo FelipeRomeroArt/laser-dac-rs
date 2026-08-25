@@ -11,7 +11,7 @@ use crate::config::StreamConfig;
 use crate::device::{DacInfo, OutputModel};
 use crate::error::{Error, Result};
 use crate::reconnect::ReconnectPolicy;
-use crate::stream::{ControlMsg, RunExit, StreamControl};
+use crate::session::{ControlMsg, SessionControl, SessionExit};
 
 use super::driver::{self, DriverInputs, SourceOwned};
 use super::engine::PresentationEngine;
@@ -24,49 +24,60 @@ use super::{default_transition, Frame, OutputResetReason, TransitionFn};
 
 /// Configuration for a frame-mode streaming session.
 pub struct FrameSessionConfig {
-    /// Points per second output rate.
-    pub pps: u32,
-    /// Transition function for blanking between frames.
-    pub transition_fn: TransitionFn,
-    /// Duration of forced blanking after arming (default: 1ms).
-    pub startup_blank: std::time::Duration,
-    /// Number of points to shift RGB relative to XY (0 = disabled).
-    ///
-    /// Delays color channels relative to XY coordinates, compensating for
-    /// the difference in galvo mirror and laser modulation response times.
-    /// Applied at composition time. Set to 0 to disable.
-    pub color_delay_points: usize,
-    /// Reconnection configuration (default: disabled).
-    ///
-    /// Set via [`with_reconnect`](Self::with_reconnect) to enable automatic
-    /// reconnection when the device disconnects.
-    pub reconnect: Option<crate::config::ReconnectConfig>,
-    /// Policy for what to output when the stream is idle (disarmed).
-    ///
-    /// Controls scanner behavior when disarmed. Default: [`Blank`](crate::config::IdlePolicy::Blank)
-    /// (park at origin with laser off). Use [`Park`](crate::config::IdlePolicy::Park) to park at a
-    /// specific position.
-    pub idle_policy: crate::config::IdlePolicy,
-    /// Optional hook for processing the final presented output.
-    pub output_filter: Option<Box<dyn super::OutputFilter>>,
+    pps: u32,
+    transition_fn: TransitionFn,
+    startup_blank: Duration,
+    color_delay: Duration,
+    reconnect: Option<crate::config::ReconnectConfig>,
+    idle_policy: crate::config::IdlePolicy,
+    output_filter: Option<Box<dyn super::OutputFilter>>,
 }
 
 impl FrameSessionConfig {
-    const DEFAULT_COLOR_DELAY: std::time::Duration = std::time::Duration::from_micros(150);
-
     /// Create a new config with the given PPS and default transition.
     pub fn new(pps: u32) -> Self {
-        let color_delay_points =
-            (Self::DEFAULT_COLOR_DELAY.as_secs_f64() * pps as f64).ceil() as usize;
         Self {
             pps,
-            transition_fn: default_transition(pps),
-            startup_blank: std::time::Duration::from_millis(1),
-            color_delay_points,
+            transition_fn: default_transition(),
+            startup_blank: Duration::from_millis(1),
+            color_delay: Duration::ZERO,
             idle_policy: crate::config::IdlePolicy::default(),
             reconnect: None,
             output_filter: None,
         }
+    }
+
+    /// Points per second output rate.
+    pub fn pps(&self) -> u32 {
+        self.pps
+    }
+    /// Transition callback used for newly composed seams.
+    pub fn transition_fn(&self) -> &TransitionFn {
+        &self.transition_fn
+    }
+    /// Duration of startup blanking after arming.
+    pub fn startup_blank(&self) -> Duration {
+        self.startup_blank
+    }
+    /// Color delay duration.
+    pub fn color_delay(&self) -> Duration {
+        self.color_delay
+    }
+    /// Reconnection configuration, when enabled.
+    pub fn reconnect(&self) -> Option<&crate::config::ReconnectConfig> {
+        self.reconnect.as_ref()
+    }
+
+    pub(crate) fn take_reconnect(&mut self) -> Option<crate::config::ReconnectConfig> {
+        self.reconnect.take()
+    }
+    /// Policy used while disarmed.
+    pub fn idle_policy(&self) -> &crate::config::IdlePolicy {
+        &self.idle_policy
+    }
+    /// Installed final-output filter, when present.
+    pub fn output_filter(&self) -> Option<&dyn super::OutputFilter> {
+        self.output_filter.as_deref()
     }
 
     /// Set the transition function (builder pattern).
@@ -81,9 +92,9 @@ impl FrameSessionConfig {
         self
     }
 
-    /// Set the color delay in points (builder pattern).
-    pub fn with_color_delay_points(mut self, n: usize) -> Self {
-        self.color_delay_points = n;
+    /// Set the color delay duration (builder pattern).
+    pub fn with_color_delay(mut self, delay: Duration) -> Self {
+        self.color_delay = delay;
         self
     }
 
@@ -198,6 +209,24 @@ impl Drop for MetricsDisconnectGuard {
     }
 }
 
+/// Keeps explicit safe teardown attached to backend ownership until the
+/// scheduler thread has successfully started and taken that ownership.
+struct StartBackendGuard(Option<BackendKind>);
+
+impl StartBackendGuard {
+    fn take(&mut self) -> BackendKind {
+        self.0.take().expect("start backend already taken")
+    }
+}
+
+impl Drop for StartBackendGuard {
+    fn drop(&mut self) {
+        if let Some(backend) = self.0.as_mut() {
+            backend.close_and_disconnect();
+        }
+    }
+}
+
 /// A frame-mode streaming session.
 ///
 /// Owns a scheduler thread that reads frames from a channel and writes them
@@ -218,8 +247,8 @@ impl Drop for MetricsDisconnectGuard {
 /// ]));
 /// ```
 pub struct FrameSession {
-    control: StreamControl,
-    thread: Option<JoinHandle<Result<RunExit>>>,
+    control: SessionControl,
+    thread: Option<JoinHandle<Result<SessionExit>>>,
     frame_slot: Arc<Mutex<Option<Frame>>>,
     metrics: FrameSessionMetrics,
 }
@@ -232,27 +261,39 @@ impl FrameSession {
         reconnect_policy: Option<ReconnectPolicy>,
     ) -> Result<Self> {
         if !backend.is_connected() {
-            backend.connect()?;
+            if let Err(err) = backend.connect() {
+                backend.close_and_disconnect();
+                return Err(err);
+            }
+            if let Err(err) = backend.set_shutter(false) {
+                backend.close_and_disconnect();
+                return Err(err);
+            }
         }
 
         let (control_tx, control_rx) = mpsc::channel();
-        let initial_color_delay = if config.color_delay_points > 0 {
-            Duration::from_secs_f64(config.color_delay_points as f64 / config.pps as f64)
-        } else {
-            Duration::ZERO
-        };
-        let control = StreamControl::new(control_tx, initial_color_delay, config.pps);
+        let control = SessionControl::new_with_pps_bounds(
+            control_tx,
+            config.color_delay,
+            config.pps,
+            backend.caps().pps_min,
+            backend.caps().pps_max,
+        );
         let frame_slot: Arc<Mutex<Option<Frame>>> = Arc::new(Mutex::new(None));
         let metrics = FrameSessionMetrics::new(backend.is_connected());
 
         let control_clone = control.clone();
         let slot_clone = frame_slot.clone();
         let metrics_clone = metrics.clone();
+        let mut backend_guard = StartBackendGuard(Some(backend));
 
-        // Named for diagnosability in profilers / thread dumps.
+        // Named for diagnosability in profilers / thread dumps. If spawning
+        // fails, dropping the captured guard explicitly closes and disconnects
+        // the backend instead of relying on its implementation's `Drop`.
         let thread = std::thread::Builder::new()
             .name("laser-frame-scheduler".to_string())
             .spawn(move || {
+                let backend = backend_guard.take();
                 // Elevate this thread's scheduling priority so pacing sleeps are
                 // less likely to be preempted under system load. Best-effort:
                 // many systems disallow raising priority without privileges
@@ -285,7 +326,7 @@ impl FrameSession {
     }
 
     /// Returns a control handle for arm/disarm/stop.
-    pub fn control(&self) -> StreamControl {
+    pub fn control(&self) -> SessionControl {
         self.control.clone()
     }
 
@@ -308,13 +349,13 @@ impl FrameSession {
     }
 
     /// Wait for the session thread to finish and return the exit reason.
-    pub fn join(mut self) -> Result<RunExit> {
+    pub fn join(mut self) -> Result<SessionExit> {
         if let Some(handle) = self.thread.take() {
             handle
                 .join()
                 .unwrap_or(Err(Error::disconnected("thread panicked")))
         } else {
-            Ok(RunExit::Stopped)
+            Ok(SessionExit::Stopped)
         }
     }
 
@@ -325,17 +366,17 @@ impl FrameSession {
     fn run_loop(
         mut backend: BackendKind,
         config: FrameSessionConfig,
-        control: StreamControl,
+        control: SessionControl,
         control_rx: mpsc::Receiver<ControlMsg>,
         frame_slot: Arc<Mutex<Option<Frame>>>,
         metrics: FrameSessionMetrics,
         reconnect_policy: Option<ReconnectPolicy>,
-    ) -> Result<RunExit> {
+    ) -> Result<SessionExit> {
         let FrameSessionConfig {
             pps: _,
             transition_fn,
             startup_blank,
-            color_delay_points,
+            color_delay,
             idle_policy,
             output_filter,
             reconnect: _,
@@ -356,7 +397,7 @@ impl FrameSession {
         };
         let mut pipeline = SlicePipeline::with_startup_blank(
             engine,
-            color_delay_points,
+            color_delay,
             output_filter,
             idle_policy,
             initial_buf_capacity,
@@ -407,7 +448,7 @@ impl FrameSession {
                     info.caps.pps_min,
                     info.caps.pps_max
                 );
-                return Err(RunExit::Disconnected);
+                return Err(SessionExit::Disconnected);
             }
             Ok(())
         })

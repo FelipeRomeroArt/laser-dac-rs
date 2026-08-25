@@ -1,12 +1,13 @@
 mod common;
 
 use std::hint::black_box;
+use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use laser_dac::benchmark_support::{
     ColorDelayBenchmark, PresentationBenchmark, SlicePipelineBenchmark, TransitionWorkload,
 };
-use laser_dac::{default_transition, Frame, LaserPoint, TransitionPlan};
+use laser_dac::{default_transition, Frame, LaserPoint, TransitionContext, TransitionPlan};
 
 const PPS: u32 = 30_000;
 const FRAME_POINTS: usize = 500;
@@ -105,7 +106,7 @@ fn benchmark_slice_pipeline_fifo(c: &mut Criterion) {
         let mut fixture = SlicePipelineBenchmark::new(
             frame.clone(),
             TransitionWorkload::Default { pps: PPS },
-            delay,
+            Duration::from_secs_f64(delay as f64 / PPS as f64),
             CHUNK_POINTS,
         );
         assert_eq!(
@@ -143,7 +144,7 @@ fn benchmark_slice_pipeline_frame_swap(c: &mut Criterion) {
             let mut fixture = SlicePipelineBenchmark::new(
                 frames[0].clone(),
                 TransitionWorkload::Default { pps: PPS },
-                delay,
+                Duration::from_secs_f64(delay as f64 / PPS as f64),
                 points,
             );
             assert!(!fixture.produce_frame_swap(PPS).is_empty());
@@ -197,7 +198,7 @@ fn benchmark_color_delay(c: &mut Criterion) {
 }
 
 fn benchmark_default_transition(c: &mut Criterion) {
-    let transition = default_transition(PPS);
+    let transition = default_transition();
     let cases = [
         (
             "short",
@@ -213,7 +214,8 @@ fn benchmark_default_transition(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("presentation/default_transition");
     for (name, from, to) in cases {
-        let expected_len = match transition(&from, &to) {
+        let context = TransitionContext { pps: PPS };
+        let expected_len = match transition(&from, &to, &context) {
             TransitionPlan::Transition(points) => points.len(),
             TransitionPlan::Coalesce => 0,
         };
@@ -221,7 +223,11 @@ fn benchmark_default_transition(c: &mut Criterion) {
         group.throughput(Throughput::Elements(expected_len as u64));
         group.bench_function(name, |b| {
             b.iter(|| {
-                black_box(transition(black_box(&from), black_box(&to)));
+                black_box(transition(
+                    black_box(&from),
+                    black_box(&to),
+                    black_box(&context),
+                ));
             });
         });
     }

@@ -40,7 +40,7 @@ The seam where [Points](#point) enter the per-[OutputModel](#outputmodel) adapte
 - `FifoContentSource` — produces variable-sized chunks for `NetworkFifo` and `UdpTimed` adapters.
 - `FrameContentSource` — produces whole frames for `UsbFrameSwap`.
 
-`SlicePipeline` (frame-mode, in `src/presentation/slice_pipeline.rs`) implements both today. The shared cache contract is: after `produce_*` returns a non-empty slice the source caches it; on a successful write the adapter calls `commit_written` exactly once; on an explicit reset path (reconnect, stop) the driver calls `discard_cached`. Sources with per-write derived state advance only in `commit_written`.
+`SlicePipeline` (frame-mode, in `src/presentation/slice_pipeline.rs`) implements both today. The shared cache contract is: after `produce_*` returns a non-empty slice the source caches it; on a successful write the adapter calls `commit_written` exactly once; on an explicit lifecycle reset (arm, disarm, reconnect, stop) the driver calls `discard_cached`. Sources with per-write derived state advance only in `commit_written`.
 
 ### Discoverer
 A protocol-owned object that locates [DACs](#dac) of one [DacType](#dac) on the local system or network and produces [DiscoveredDevices](#discovereddevice) for them.

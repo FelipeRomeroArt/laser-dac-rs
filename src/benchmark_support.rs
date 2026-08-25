@@ -26,8 +26,8 @@ pub enum TransitionWorkload {
 impl TransitionWorkload {
     fn build(self) -> TransitionFn {
         match self {
-            Self::Coalesce => Box::new(|_, _| TransitionPlan::Coalesce),
-            Self::Default { pps } => default_transition(pps),
+            Self::Coalesce => Box::new(|_, _, _| TransitionPlan::Coalesce),
+            Self::Default { .. } => default_transition(),
         }
     }
 }
@@ -35,13 +35,18 @@ impl TransitionWorkload {
 /// Reusable fixture for `PresentationEngine` benchmarks.
 pub struct PresentationBenchmark {
     engine: PresentationEngine,
+    pps: u32,
 }
 
 impl PresentationBenchmark {
     pub fn new(initial: Frame, transition: TransitionWorkload) -> Self {
+        let pps = match transition {
+            TransitionWorkload::Default { pps } => pps,
+            TransitionWorkload::Coalesce => 30_000,
+        };
         let mut engine = PresentationEngine::new(transition.build());
         engine.set_pending(initial);
-        Self { engine }
+        Self { engine, pps }
     }
 
     pub fn queue_frame(&mut self, frame: Frame) {
@@ -53,11 +58,11 @@ impl PresentationBenchmark {
     }
 
     pub fn fill_chunk(&mut self, output: &mut [LaserPoint]) -> usize {
-        self.engine.fill_chunk(output, output.len())
+        self.engine.fill_chunk(output, output.len(), self.pps)
     }
 
     pub fn compose_hardware_frame(&mut self) -> &[LaserPoint] {
-        self.engine.compose_hardware_frame()
+        self.engine.compose_hardware_frame(self.pps)
     }
 }
 
@@ -70,13 +75,13 @@ impl SlicePipelineBenchmark {
     pub fn new(
         frame: Frame,
         transition: TransitionWorkload,
-        color_delay_points: usize,
+        color_delay: Duration,
         initial_capacity: usize,
     ) -> Self {
         let engine = PresentationEngine::new(transition.build());
         let mut pipeline = SlicePipeline::with_startup_blank(
             engine,
-            color_delay_points,
+            color_delay,
             None,
             IdlePolicy::Blank,
             initial_capacity,
@@ -315,7 +320,7 @@ impl ChunkPipelineBenchmark {
     pub fn new(
         frame: Frame,
         transition: TransitionWorkload,
-        color_delay_points: usize,
+        color_delay: Duration,
         chunk_points: usize,
         target: ChunkTarget,
     ) -> Self {
@@ -325,7 +330,7 @@ impl ChunkPipelineBenchmark {
         }
         let mut pipeline = SlicePipeline::with_startup_blank(
             engine,
-            color_delay_points,
+            color_delay,
             None,
             IdlePolicy::Blank,
             chunk_points,
@@ -578,8 +583,12 @@ mod tests {
     #[test]
     fn slice_pipeline_fixture_produces_frame_swap_frame() {
         let frame = Frame::new(points(64));
-        let mut fixture =
-            SlicePipelineBenchmark::new(frame, TransitionWorkload::Default { pps: 30_000 }, 5, 64);
+        let mut fixture = SlicePipelineBenchmark::new(
+            frame,
+            TransitionWorkload::Default { pps: 30_000 },
+            Duration::from_micros(167),
+            64,
+        );
         assert!(!fixture.produce_frame_swap(30_000).is_empty());
     }
 
@@ -612,7 +621,7 @@ mod tests {
             let mut fixture = ChunkPipelineBenchmark::new(
                 frame.clone(),
                 TransitionWorkload::Default { pps: 30_000 },
-                0,
+                Duration::ZERO,
                 179,
                 target,
             );
@@ -631,7 +640,7 @@ mod tests {
             let mut fixture = ChunkPipelineBenchmark::new(
                 frame.clone(),
                 TransitionWorkload::Coalesce,
-                0,
+                Duration::ZERO,
                 179,
                 target,
             );
@@ -657,7 +666,7 @@ mod tests {
         let mut fixture = ChunkPipelineBenchmark::new(
             frame,
             TransitionWorkload::Coalesce,
-            0,
+            Duration::ZERO,
             179,
             ChunkTarget::Idn,
         );

@@ -7,7 +7,8 @@
 //!   [`crate::device`]
 //! - [`StreamConfig`], [`IdlePolicy`], [`ReconnectConfig`] → [`crate::config`]
 //! - [`StreamInstant`], [`ChunkRequest`], [`ChunkResult`], [`StreamStatus`],
-//!   [`StreamStats`], [`RunExit`] → [`crate::stream`]
+//!   [`StreamStats`] → [`crate::stream`]
+//! - [`SessionExit`] → [`crate::session`]
 //!
 //! This module re-exports them so existing `laser_dac::types::Foo` paths keep
 //! working. Prefer the new module paths in new code.
@@ -20,6 +21,5 @@ pub use crate::device::{
     EnabledDacTypes, OutputModel,
 };
 pub use crate::point::LaserPoint;
-pub use crate::stream::{
-    ChunkRequest, ChunkResult, RunExit, StreamInstant, StreamStats, StreamStatus,
-};
+pub use crate::session::SessionExit;
+pub use crate::stream::{ChunkRequest, ChunkResult, StreamInstant, StreamStats, StreamStatus};

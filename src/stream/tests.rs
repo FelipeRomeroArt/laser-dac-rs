@@ -3,9 +3,9 @@ use crate::backend::{BackendKind, DacBackend, FifoBackend, WriteOutcome};
 use crate::buffer_estimate::{BufferEstimator, SoftwareDecayEstimator};
 use crate::config::IdlePolicy;
 use crate::device::OutputModel;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Shared `SoftwareDecayEstimator` test wrapper. Backends update it from
 /// inside `try_write_points`; tests mutate it via cloned handles to seed the
@@ -53,6 +53,10 @@ struct TestBackend {
     queued: Arc<AtomicU64>,
     /// Track shutter state for testing
     shutter_open: Arc<AtomicBool>,
+    shutter_calls: Arc<AtomicUsize>,
+    disconnect_calls: Arc<AtomicUsize>,
+    /// Capability limit discovered only after `connect`.
+    live_pps_max: Option<u32>,
     /// Decaying estimator the stream consults; tests can seed via `estimator.seed()`.
     estimator: SharedEstimator,
     /// Every point value accepted by `try_write_points`, in write order. Lets
@@ -75,6 +79,9 @@ impl TestBackend {
             would_block_count: Arc::new(AtomicUsize::new(0)),
             queued: Arc::new(AtomicU64::new(0)),
             shutter_open: Arc::new(AtomicBool::new(false)),
+            shutter_calls: Arc::new(AtomicUsize::new(0)),
+            disconnect_calls: Arc::new(AtomicUsize::new(0)),
+            live_pps_max: None,
             estimator: SharedEstimator::new(),
             received: Arc::new(Mutex::new(Vec::new())),
         }
@@ -92,6 +99,11 @@ impl TestBackend {
 
     fn with_output_model(mut self, model: OutputModel) -> Self {
         self.caps.output_model = model;
+        self
+    }
+
+    fn with_live_pps_max(mut self, max: u32) -> Self {
+        self.live_pps_max = Some(max);
         self
     }
 
@@ -116,11 +128,15 @@ impl DacBackend for TestBackend {
 
     fn connect(&mut self) -> Result<()> {
         self.connected = true;
+        if let Some(max) = self.live_pps_max {
+            self.caps.pps_max = max;
+        }
         Ok(())
     }
 
     fn disconnect(&mut self) -> Result<()> {
         self.connected = false;
+        self.disconnect_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -133,6 +149,7 @@ impl DacBackend for TestBackend {
     }
 
     fn set_shutter(&mut self, open: bool) -> Result<()> {
+        self.shutter_calls.fetch_add(1, Ordering::SeqCst);
         self.shutter_open.store(open, Ordering::SeqCst);
         Ok(())
     }
@@ -223,9 +240,9 @@ impl crate::backend::FrameSwapBackend for FrameSwapTestBackend {
 }
 
 #[test]
-fn test_stream_control_arm_disarm() {
+fn test_session_control_arm_disarm() {
     let (tx, _rx) = mpsc::channel();
-    let control = StreamControl::new(tx, Duration::ZERO, 30_000);
+    let control = SessionControl::new(tx, Duration::ZERO, 30_000);
     assert!(!control.is_armed());
 
     control.arm().unwrap();
@@ -236,9 +253,81 @@ fn test_stream_control_arm_disarm() {
 }
 
 #[test]
-fn test_stream_control_stop() {
+fn session_control_rejects_pps_outside_active_backend_bounds() {
     let (tx, _rx) = mpsc::channel();
-    let control = StreamControl::new(tx, Duration::ZERO, 30_000);
+    let control = SessionControl::new_with_pps_bounds(tx, Duration::ZERO, 30_000, 10_000, 40_000);
+
+    assert!(control.set_pps(9_999).is_err());
+    assert!(control.set_pps(40_001).is_err());
+    assert_eq!(control.pps(), 30_000);
+    control.set_pps(40_000).unwrap();
+    assert_eq!(control.pps(), 40_000);
+
+    assert!(control.update_pps_bounds(20_000, 35_000).is_err());
+    assert!(
+        control.set_pps(39_000).is_ok(),
+        "failed update must keep old bounds"
+    );
+}
+
+#[test]
+fn session_control_preserves_full_color_delay_precision_and_range() {
+    let (tx, _rx) = mpsc::channel();
+    let initial = Duration::from_nanos(1);
+    let control = SessionControl::new(tx, initial, 30_000);
+    assert_eq!(control.color_delay(), initial);
+
+    let precise = Duration::new(12, 345_678_901);
+    control.set_color_delay(precise);
+    assert_eq!(control.color_delay(), precise);
+
+    control.set_color_delay(Duration::MAX);
+    assert_eq!(control.color_delay(), Duration::MAX);
+}
+
+#[test]
+fn test_pps_and_bounds_updates_are_one_coherent_transaction() {
+    use std::sync::Barrier;
+    use std::thread;
+
+    for _ in 0..100 {
+        let (tx, _rx) = mpsc::channel();
+        let control =
+            SessionControl::new_with_pps_bounds(tx, Duration::ZERO, 30_000, 10_000, 40_000);
+        let barrier = Arc::new(Barrier::new(3));
+        let set_control = control.clone();
+        let set_barrier = barrier.clone();
+        let setter = thread::spawn(move || {
+            set_barrier.wait();
+            set_control.set_pps(35_000)
+        });
+        let bounds_control = control.clone();
+        let bounds_barrier = barrier.clone();
+        let updater = thread::spawn(move || {
+            bounds_barrier.wait();
+            bounds_control.update_pps_bounds(10_000, 32_000)
+        });
+        barrier.wait();
+        let set_ok = setter.join().unwrap().is_ok();
+        let bounds_ok = updater.join().unwrap().is_ok();
+        assert_ne!(set_ok, bounds_ok);
+        assert!(matches!(control.pps(), 30_000 | 35_000));
+    }
+}
+
+#[test]
+fn test_session_control_reports_notification_failure_after_recording_state() {
+    let (tx, rx) = mpsc::channel();
+    drop(rx);
+    let control = SessionControl::new(tx, Duration::ZERO, 30_000);
+    assert!(control.arm().is_err());
+    assert!(control.is_armed());
+}
+
+#[test]
+fn test_session_control_stop() {
+    let (tx, _rx) = mpsc::channel();
+    let control = SessionControl::new(tx, Duration::ZERO, 30_000);
     assert!(!control.is_stop_requested());
 
     control.stop().unwrap();
@@ -246,9 +335,9 @@ fn test_stream_control_stop() {
 }
 
 #[test]
-fn test_stream_control_clone_shares_state() {
+fn test_session_control_clone_shares_state() {
     let (tx, _rx) = mpsc::channel();
-    let control1 = StreamControl::new(tx, Duration::ZERO, 30_000);
+    let control1 = SessionControl::new(tx, Duration::ZERO, 30_000);
     let control2 = control1.clone();
 
     control1.arm().unwrap();
@@ -273,6 +362,66 @@ fn test_device_start_stream_connects_backend() {
 }
 
 #[test]
+fn public_start_stream_revalidates_live_caps_and_closes_connected_output() {
+    let mut backend = TestBackend::new().with_live_pps_max(20_000);
+    let shutter = backend.shutter_open.clone();
+    let shutter_calls = backend.shutter_calls.clone();
+    backend.connect().unwrap();
+    backend.set_shutter(true).unwrap();
+    shutter_calls.store(0, Ordering::SeqCst);
+    let device = Dac::new(
+        test_info(&DacCapabilities {
+            pps_max: 100_000,
+            ..backend.caps().clone()
+        }),
+        BackendKind::Fifo(Box::new(backend)),
+    );
+
+    let (stream, info) = device.start_stream(StreamConfig::new(15_000)).unwrap();
+    assert!(!shutter.load(Ordering::SeqCst));
+    assert_eq!(shutter_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(info.caps.pps_max, 20_000);
+    assert_eq!(stream.info().caps.pps_max, 20_000);
+    assert!(stream.control().set_pps(20_001).is_err());
+}
+
+#[test]
+fn public_start_stream_rejects_pps_above_post_connect_limit_and_cleans_up() {
+    let backend = TestBackend::new().with_live_pps_max(20_000);
+    let shutter_calls = backend.shutter_calls.clone();
+    let disconnect_calls = backend.disconnect_calls.clone();
+    let device = Dac::new(
+        test_info(backend.caps()),
+        BackendKind::Fifo(Box::new(backend)),
+    );
+    assert!(device.start_stream(StreamConfig::new(30_000)).is_err());
+    assert_eq!(shutter_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(disconnect_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn public_start_frame_session_rejects_pps_above_post_connect_limit_and_cleans_up() {
+    let backend = FrameSwapTestBackend {
+        inner: TestBackend::new()
+            .with_output_model(OutputModel::UsbFrameSwap)
+            .with_live_pps_max(20_000),
+        frame_capacity: 4095,
+        ready: Arc::new(AtomicBool::new(true)),
+    };
+    let shutter_calls = backend.inner.shutter_calls.clone();
+    let disconnect_calls = backend.inner.disconnect_calls.clone();
+    let device = Dac::new(
+        test_info(backend.caps()),
+        BackendKind::FrameSwap(Box::new(backend)),
+    );
+    assert!(device
+        .start_frame_session(crate::presentation::FrameSessionConfig::new(30_000))
+        .is_err());
+    assert_eq!(shutter_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(disconnect_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn test_device_start_stream_promotes_untouched_defaults_for_network_backends() {
     let mut backend = TestBackend::new();
     backend.caps.output_model = OutputModel::NetworkFifo;
@@ -286,7 +435,7 @@ fn test_device_start_stream_promotes_untouched_defaults_for_network_backends() {
     let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
 
     assert_eq!(
-        stream.config.target_buffer,
+        stream.config.target_buffer(),
         StreamConfig::NETWORK_DEFAULT_TARGET_BUFFER
     );
 }
@@ -305,7 +454,7 @@ fn test_device_start_stream_does_not_promote_custom_backends() {
     let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
 
     assert_eq!(
-        stream.config.target_buffer,
+        stream.config.target_buffer(),
         StreamConfig::DEFAULT_TARGET_BUFFER
     );
 }
@@ -322,7 +471,7 @@ fn test_device_start_stream_promotes_blocking_fifo_backends() {
     let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
 
     assert_eq!(
-        stream.config.target_buffer,
+        stream.config.target_buffer(),
         StreamConfig::NETWORK_DEFAULT_TARGET_BUFFER
     );
 }
@@ -338,7 +487,7 @@ fn test_device_start_stream_promotes_lasercube_network_default_buffer() {
     let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
 
     assert_eq!(
-        stream.config.target_buffer,
+        stream.config.target_buffer(),
         StreamConfig::LASERCUBE_NETWORK_DEFAULT_TARGET_BUFFER
     );
 }
@@ -355,7 +504,7 @@ fn test_device_start_stream_keeps_explicit_network_buffer_settings() {
     let cfg = StreamConfig::new(30_000).with_target_buffer(Duration::from_millis(12));
     let (stream, _info) = device.start_stream(cfg).unwrap();
 
-    assert_eq!(stream.config.target_buffer, Duration::from_millis(12));
+    assert_eq!(stream.config.target_buffer(), Duration::from_millis(12));
 }
 
 // Removed `test_device_start_stream_keeps_usb_defaults`: it constructed an
@@ -391,7 +540,7 @@ fn test_run_retries_on_would_block() {
         |_e| {},
     );
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
     // WouldBlock retries happen internally in the driver's write spin.
     // The exact count depends on timing, but we should see multiple writes.
     assert!(write_count.load(Ordering::SeqCst) >= 1);
@@ -432,7 +581,7 @@ fn test_run_buffer_driven_behavior() {
         |_e| {},
     );
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
     assert!(
         write_count.load(Ordering::SeqCst) >= 4,
         "Should have written multiple chunks"
@@ -457,7 +606,7 @@ fn test_run_uses_configured_target_buffer() {
         |_e| {},
     );
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
     assert_eq!(observed.load(Ordering::SeqCst), 100);
 }
 
@@ -495,7 +644,7 @@ fn test_run_sleeps_when_buffer_healthy() {
         |_e| {},
     );
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
 
     // Should have taken some time due to buffer-driven sleep
     let elapsed = start_time.elapsed();
@@ -535,7 +684,7 @@ fn test_run_stops_on_control_stop() {
     );
 
     // Should exit with Stopped, not hang forever
-    assert_eq!(result.unwrap(), RunExit::Stopped);
+    assert_eq!(result.unwrap(), SessionExit::Stopped);
 }
 
 #[test]
@@ -565,7 +714,7 @@ fn test_run_producer_ended() {
         |_e| {},
     );
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
     assert_eq!(call_count.load(Ordering::SeqCst), 2);
 }
 
@@ -596,7 +745,7 @@ fn test_run_starved_applies_underrun_policy() {
         |_e| {},
     );
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
 
     // Underrun policy should have written some points
     assert!(
@@ -631,7 +780,7 @@ fn test_run_filled_zero_with_target_treated_as_starved() {
         |_e| {},
     );
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
 
     // Filled(0) with target_points > 0 should trigger underrun policy
     assert!(
@@ -680,7 +829,7 @@ fn test_run_color_delay_blanks_leading_points() {
         },
         |_e| {},
     );
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
 
     let pts = received.lock().unwrap();
     assert!(pts.len() > 3, "expected at least one written chunk");
@@ -730,7 +879,7 @@ fn test_run_startup_blank_blanks_first_n_points() {
         },
         |_e| {},
     );
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
 
     let pts = received.lock().unwrap();
     assert!(pts.len() > 5, "expected at least one written chunk");
@@ -768,7 +917,7 @@ fn test_estimate_buffer_reads_backend_estimator() {
         "estimate ~300 (seeded depth, minus slight decay), got {first}"
     );
 
-    estimator.seed(800, stream.config.pps);
+    estimator.seed(800, stream.config.pps());
     let second = stream.estimate_buffer_points();
     assert!(
         (790..=800).contains(&second),
@@ -811,7 +960,7 @@ fn test_fill_result_filled_writes_points_and_updates_state() {
         |_e| {},
     );
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
 
     // Points should have been written to backend
     // Note: drain adds 16 blank points at shutdown
@@ -878,7 +1027,7 @@ fn test_fill_result_filled_updates_last_chunk_when_armed() {
         |_e| {},
     );
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
 
     let produced = produced.load(Ordering::SeqCst);
     let pts = received.lock().unwrap();
@@ -936,7 +1085,7 @@ fn test_fill_result_starved_repeat_last_with_stored_chunk() {
         |_e| {},
     );
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
 
     // Both the initial fill and the repeated chunk should have been written
     let total_queued = queued.load(Ordering::SeqCst);
@@ -976,7 +1125,7 @@ fn test_fill_result_starved_repeat_last_without_stored_chunk_falls_back_to_blank
         |_e| {},
     );
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
 
     // Should have written blank points as fallback
     let total_queued = queued.load(Ordering::SeqCst);
@@ -1015,7 +1164,7 @@ fn test_fill_result_starved_with_park_policy() {
         |_e| {},
     );
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
 
     // Should have written parked points
     let total_queued = queued.load(Ordering::SeqCst);
@@ -1023,10 +1172,14 @@ fn test_fill_result_starved_with_park_policy() {
 }
 
 #[test]
-fn test_fill_result_starved_with_stop_policy() {
-    // Test that Starved with Stop policy terminates the stream
+fn test_fill_result_starved_with_stop_policy_closes_hardware_shutter() {
+    // Test that Starved with Stop policy terminates the stream and forces the
+    // hardware shutter closed on the abrupt Error::Stopped exit.
+    let backend = TestBackend::new();
+    let shutter_open = backend.shutter_open.clone();
+    let shutter_calls = backend.shutter_calls.clone();
     let cfg = StreamConfig::new(30000).with_idle_policy(IdlePolicy::Stop);
-    let stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
+    let stream = make_test_stream_with_cfg(backend, cfg);
 
     // Must arm the stream for underrun policy to be checked
     // (disarmed streams always output blanks regardless of policy)
@@ -1048,6 +1201,14 @@ fn test_fill_result_starved_with_stop_policy() {
         result.unwrap_err().is_stopped(),
         "Error should be Stopped variant"
     );
+    assert!(
+        !shutter_open.load(Ordering::SeqCst),
+        "IdlePolicy::Stop must close the hardware shutter before returning"
+    );
+    assert!(
+        shutter_calls.load(Ordering::SeqCst) >= 2,
+        "expected an arm open followed by an explicit safety close"
+    );
 }
 
 #[test]
@@ -1063,7 +1224,7 @@ fn test_fill_result_end_returns_producer_ended() {
         |_e| {},
     );
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
 }
 
 #[test]
@@ -1094,7 +1255,7 @@ fn test_fill_result_filled_exceeds_buffer_clamped() {
         |_e| {},
     );
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
 
     // Should have written clamped number of points (max_points_per_chunk)
     // plus 16 blank points from drain shutdown
@@ -1161,7 +1322,7 @@ fn test_full_stream_lifecycle_create_arm_stream_stop() {
     );
 
     // 5. Verify stream ended properly
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
     assert!(
         queued.load(Ordering::SeqCst) > 0,
         "Should have written points"
@@ -1219,7 +1380,7 @@ fn test_full_stream_lifecycle_with_idle_policy_recovery() {
         |_e| {},
     );
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
     // Should have written: initial data + repeated chunk + recovered data
     let total = queued.load(Ordering::SeqCst);
     assert!(
@@ -1256,7 +1417,7 @@ fn test_full_stream_lifecycle_external_stop() {
         |_e| {},
     );
 
-    assert_eq!(result.unwrap(), RunExit::Stopped);
+    assert_eq!(result.unwrap(), SessionExit::Stopped);
 }
 
 #[test]
@@ -1288,7 +1449,7 @@ fn test_full_stream_lifecycle_into_dac_recovery() {
         |_e| {},
     );
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
 
     // Note: into_dac() would be tested here, but run consumes the stream
     // and doesn't return it. The into_dac pattern is for the blocking API.
@@ -1330,7 +1491,7 @@ fn test_stream_disarm_during_streaming() {
         |_e| {},
     );
 
-    assert_eq!(result.unwrap(), RunExit::Stopped);
+    assert_eq!(result.unwrap(), SessionExit::Stopped);
     // Stopping must never leave the shutter open, regardless of whether the
     // queued disarm was drained before the stop was observed (the driver
     // closes it on every stop-exit path — see stop_and_close_shutter).
@@ -1372,7 +1533,7 @@ fn run_disarmed_and_capture(cfg: StreamConfig) -> Vec<LaserPoint> {
         },
         |_e| {},
     );
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
     let pts = received.lock().unwrap().clone();
     assert!(pts.len() > 10, "expected at least one written chunk");
     pts
@@ -1513,7 +1674,7 @@ fn test_stream_with_mock_backend_disconnect() {
     );
 
     // Should return Disconnected when backend reports disconnection
-    assert_eq!(result.unwrap(), RunExit::Disconnected);
+    assert_eq!(result.unwrap(), SessionExit::Disconnected);
 }
 
 // =========================================================================
@@ -1521,7 +1682,7 @@ fn test_stream_with_mock_backend_disconnect() {
 //
 // These verify that a non-disconnected write error (Error::Backend) causes
 // the backend to be disconnected, so the stream exits with
-// RunExit::Disconnected and the device can be reconnected.
+// SessionExit::Disconnected and the device can be reconnected.
 //
 // Without the fix (backend.disconnect() on a non-disconnected write error in
 // the driver's write path), the backend stays "connected" and the stream loops
@@ -1645,9 +1806,11 @@ fn test_start_stream_with_reconnect_rejects_invalid_pps() {
 }
 
 #[test]
-fn test_start_stream_reconnect_without_target_errors() {
+fn test_start_stream_reconnect_without_target_errors_and_cleans_up() {
     // start_stream with reconnect on a Dac created via Dac::new (no target) should error
     let backend = TestBackend::new();
+    let shutter_calls = backend.shutter_calls.clone();
+    let disconnect_calls = backend.disconnect_calls.clone();
     let device = Dac::new(
         test_info(backend.caps()),
         BackendKind::Fifo(Box::new(backend)),
@@ -1666,6 +1829,8 @@ fn test_start_stream_reconnect_without_target_errors() {
         }
         Ok(_) => panic!("expected error for reconnect without target"),
     }
+    assert_eq!(shutter_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(disconnect_calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -1804,7 +1969,7 @@ fn make_test_stream_with_cfg(mut backend: impl FifoBackend + 'static, cfg: Strea
 #[test]
 fn test_backend_write_error_exits_with_disconnected() {
     // When try_write_chunk returns a non-disconnected error (Error::Backend),
-    // the stream should disconnect the backend and exit with RunExit::Disconnected.
+    // the stream should disconnect the backend and exit with SessionExit::Disconnected.
     //
     // Without the fix, the stream loops forever because is_connected() stays
     // true. This test would hang/timeout without the backend.disconnect() call.
@@ -1819,7 +1984,7 @@ fn test_backend_write_error_exits_with_disconnected() {
 
     assert_eq!(
         result.unwrap(),
-        RunExit::Disconnected,
+        SessionExit::Disconnected,
         "Write error should cause stream to exit with Disconnected"
     );
     assert!(
@@ -1843,7 +2008,7 @@ fn test_backend_write_error_fires_on_error() {
         }
     });
 
-    assert_eq!(result.unwrap(), RunExit::Disconnected);
+    assert_eq!(result.unwrap(), SessionExit::Disconnected);
     assert!(
         got_backend_error.load(Ordering::SeqCst),
         "on_error should have received the Backend error"
@@ -1859,7 +2024,7 @@ fn test_backend_write_error_immediate_fail() {
 
     assert_eq!(
         result.unwrap(),
-        RunExit::Disconnected,
+        SessionExit::Disconnected,
         "Immediate write failure should exit with Disconnected"
     );
 }
@@ -1889,7 +2054,7 @@ fn test_helios_status_timeout_exits_with_disconnected() {
     //   1. status() → read_response FAILED: Timeout (32ms interrupt read)
     //   2. Error mapped to Error::Backend (not Disconnected)
     //   3. Stream calls backend.disconnect() → dac = None
-    //   4. Next loop: is_connected() = false → RunExit::Disconnected
+    //   4. Next loop: is_connected() = false → SessionExit::Disconnected
     use std::thread;
 
     let backend = helios_like_backend(3);
@@ -1901,7 +2066,7 @@ fn test_helios_status_timeout_exits_with_disconnected() {
 
     assert_eq!(
         result.unwrap(),
-        RunExit::Disconnected,
+        SessionExit::Disconnected,
         "Helios status timeout should cause stream to exit with Disconnected"
     );
     assert!(
@@ -1928,7 +2093,7 @@ fn test_helios_status_timeout_fires_on_error_with_backend_variant() {
         }
     });
 
-    assert_eq!(result.unwrap(), RunExit::Disconnected);
+    assert_eq!(result.unwrap(), SessionExit::Disconnected);
     assert!(
         got_backend_error.load(Ordering::SeqCst),
         "on_error should receive Error::Backend for Helios timeout"
@@ -1953,7 +2118,7 @@ fn test_helios_immediate_status_timeout() {
 
     assert_eq!(
         result.unwrap(),
-        RunExit::Disconnected,
+        SessionExit::Disconnected,
         "Immediate status timeout should exit with Disconnected"
     );
     assert!(
@@ -1992,7 +2157,7 @@ fn test_fill_result_end_drains_with_queue_depth() {
 
     let elapsed = start.elapsed();
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
     // An empty queue must not consume the 2s drain timeout.
     assert!(
         elapsed < Duration::from_millis(500),
@@ -2026,7 +2191,7 @@ fn test_fill_result_end_respects_drain_timeout() {
 
     let elapsed = start.elapsed();
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
     // Should timeout around 50ms, allow some margin
     assert!(
         elapsed.as_millis() >= 40 && elapsed.as_millis() < 150,
@@ -2057,7 +2222,7 @@ fn test_fill_result_end_skips_drain_with_zero_timeout() {
 
     let elapsed = start.elapsed();
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
     // Should return immediately
     assert!(
         elapsed.as_millis() < 20,
@@ -2079,7 +2244,7 @@ fn test_fill_result_end_drains_with_empty_estimator() {
 
     let elapsed = start.elapsed();
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
     // Without queue depth, drain sleeps for estimated buffer time (0 here)
     // So should return quickly
     assert!(
@@ -2114,7 +2279,7 @@ fn test_fill_result_end_closes_shutter() {
         |_e| {},
     );
 
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(result.unwrap(), SessionExit::ProducerEnded);
     // Shutter should be closed after graceful shutdown
     assert!(
         !shutter_open.load(Ordering::SeqCst),
@@ -2127,8 +2292,14 @@ fn test_fill_result_end_closes_shutter() {
 // =========================================================================
 
 #[test]
-fn test_device_start_stream_rejects_frame_swap_backend() {
-    let backend = FrameSwapTestBackend::new();
+fn test_device_start_stream_rejects_already_connected_frame_swap_backend_safely() {
+    let mut backend = FrameSwapTestBackend::new();
+    backend.connect().unwrap();
+    backend.set_shutter(true).unwrap();
+    let shutter_open = backend.inner.shutter_open.clone();
+    let shutter_calls = backend.inner.shutter_calls.clone();
+    let disconnect_calls = backend.inner.disconnect_calls.clone();
+    shutter_calls.store(0, Ordering::SeqCst);
     let device = Dac::new(
         test_info(&backend.inner.caps),
         BackendKind::FrameSwap(Box::new(backend)),
@@ -2145,6 +2316,9 @@ fn test_device_start_stream_rejects_frame_swap_backend() {
         }
         Ok(_) => panic!("expected start_stream to reject frame-swap backend"),
     }
+    assert!(!shutter_open.load(Ordering::SeqCst));
+    assert_eq!(shutter_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(disconnect_calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -2279,8 +2453,8 @@ impl DacBackend for ReconnectFifoBackend {
     }
     fn caps(&self) -> &DacCapabilities {
         static CAPS: DacCapabilities = DacCapabilities {
-            pps_min: 1000,
-            pps_max: 100000,
+            pps_min: 20_000,
+            pps_max: 40_000,
             max_points_per_chunk: 1000,
             output_model: crate::device::OutputModel::NetworkFifo,
         };
@@ -2637,7 +2811,7 @@ fn run_reports_real_stats_after_end_to_end_streaming() {
 
     control.stop().unwrap();
     let result = handle.join().expect("stream thread panicked");
-    assert_eq!(result.unwrap(), RunExit::Stopped);
+    assert_eq!(result.unwrap(), SessionExit::Stopped);
 
     let stats = stats_handle.snapshot();
     assert!(
@@ -2884,7 +3058,7 @@ fn run_rejects_frame_swap_replacement_and_returns_disconnected() {
     let result = stream.run(blank_producer, |_e| {});
     assert_eq!(
         result.unwrap(),
-        RunExit::Disconnected,
+        SessionExit::Disconnected,
         "a frame-swap replacement is incompatible with streaming"
     );
     assert!(
@@ -2914,7 +3088,7 @@ fn run_rejects_incompatible_pps_replacement_and_returns_disconnected() {
     let result = stream.run(blank_producer, |_e| {});
     assert_eq!(
         result.unwrap(),
-        RunExit::Disconnected,
+        SessionExit::Disconnected,
         "reconnected device PPS range must contain the stream config PPS"
     );
     assert!(
@@ -2943,7 +3117,7 @@ fn run_rejects_mismatched_output_model_replacement_and_returns_disconnected() {
     let result = stream.run(blank_producer, |_e| {});
     assert_eq!(
         result.unwrap(),
-        RunExit::Disconnected,
+        SessionExit::Disconnected,
         "a replacement with a different OutputModel must be rejected: the \
          pacing adapter cannot be swapped mid-stream"
     );
@@ -3016,11 +3190,16 @@ fn stream_reconnects_through_run_driver_path() {
         reconnected.load(Ordering::SeqCst),
         "on_reconnect should fire via the run() driver path"
     );
+    assert!(
+        control.set_pps(50_000).is_err(),
+        "runtime PPS bounds must update to the accepted replacement"
+    );
+    control.set_pps(40_000).unwrap();
 
     // Stop the (now healthy) stream and verify a clean exit.
     control.stop().unwrap();
     let result = handle.join().expect("stream thread panicked");
-    assert_eq!(result.unwrap(), RunExit::Stopped);
+    assert_eq!(result.unwrap(), SessionExit::Stopped);
 
     assert!(
         scan_count.load(Ordering::SeqCst) > 0,

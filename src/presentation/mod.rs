@@ -42,20 +42,17 @@ use std::time::Duration;
 /// Zero duration or zero pps yields zero points.
 pub(crate) fn duration_to_points(d: Duration, pps: u32) -> usize {
     if d.is_zero() || pps == 0 {
-        0
-    } else {
-        (d.as_secs_f64() * pps as f64).ceil() as usize
+        return 0;
     }
-}
 
-/// Convert a microsecond count to a point count at the given rate, rounded up.
-/// Zero micros or zero pps yields zero points.
-pub(crate) fn duration_micros_to_points(micros: u64, pps: u32) -> usize {
-    if micros == 0 || pps == 0 {
-        0
-    } else {
-        (micros as f64 * pps as f64 / 1_000_000.0).ceil() as usize
-    }
+    // Use integer nanoseconds so sub-microsecond precision is preserved and
+    // the documented ceil(delay * pps) behavior is exact. Duration's maximum
+    // multiplied by u32::MAX fits in u128; saturating the final conversion
+    // avoids wrapping on platforms whose usize cannot represent the result.
+    const NANOS_PER_SEC: u128 = 1_000_000_000;
+    let nanos = u128::from(d.as_secs()) * NANOS_PER_SEC + u128::from(d.subsec_nanos());
+    let points = (nanos * u128::from(pps)).div_ceil(NANOS_PER_SEC);
+    usize::try_from(points).unwrap_or(usize::MAX)
 }
 
 /// The blank park point implied by an idle policy: `Park { x, y }` parks at the
@@ -236,7 +233,15 @@ pub enum TransitionPlan {
 ///
 /// Self-loops (A→A) also run through this callback, so transition planning
 /// is consistent regardless of whether the frame changed.
-pub type TransitionFn = Box<dyn Fn(&LaserPoint, &LaserPoint) -> TransitionPlan + Send>;
+/// Runtime values available when a seam is newly composed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransitionContext {
+    /// Current session output rate.
+    pub pps: u32,
+}
+
+pub type TransitionFn =
+    Box<dyn Fn(&LaserPoint, &LaserPoint, &TransitionContext) -> TransitionPlan + Send>;
 
 /// Default blanking transition settings (microseconds).
 ///
@@ -244,7 +249,10 @@ pub type TransitionFn = Box<dyn Fn(&LaserPoint, &LaserPoint) -> TransitionPlan +
 const END_DWELL_US: f64 = 100.0;
 const START_DWELL_US: f64 = 400.0;
 
-/// Create the default transition function for the given PPS.
+/// Create the default transition function.
+///
+/// Dwell point counts are calculated from the current [`TransitionContext`]
+/// each time a seam is composed, so runtime PPS changes affect the next seam.
 ///
 /// Produces a 3-phase blanking sequence between frames:
 ///
@@ -257,40 +265,41 @@ const START_DWELL_US: f64 = 400.0;
 ///
 /// All points are blanked. The on-beam dwell phases (post-on, pre-on) from
 /// the full 5-phase sequence are omitted — those are the frame's responsibility.
-pub fn default_transition(pps: u32) -> TransitionFn {
-    let end_dwell = (END_DWELL_US * pps as f64 / 1_000_000.0).round() as usize;
-    let start_dwell = (START_DWELL_US * pps as f64 / 1_000_000.0).round() as usize;
+pub fn default_transition() -> TransitionFn {
+    Box::new(
+        move |from: &LaserPoint, to: &LaserPoint, context: &TransitionContext| {
+            let end_dwell = (END_DWELL_US * context.pps as f64 / 1_000_000.0).round() as usize;
+            let start_dwell = (START_DWELL_US * context.pps as f64 / 1_000_000.0).round() as usize;
+            let dx = to.x - from.x;
+            let dy = to.y - from.y;
 
-    Box::new(move |from: &LaserPoint, to: &LaserPoint| {
-        let dx = to.x - from.x;
-        let dy = to.y - from.y;
+            // L-infinity distance (correct for independent galvo axes)
+            let d_inf = dx.abs().max(dy.abs());
+            let transit = (32.0 * d_inf).ceil().clamp(0.0, 64.0) as usize;
 
-        // L-infinity distance (correct for independent galvo axes)
-        let d_inf = dx.abs().max(dy.abs());
-        let transit = (32.0 * d_inf).ceil().clamp(0.0, 64.0) as usize;
+            let total = end_dwell + transit + start_dwell;
+            let mut points = Vec::with_capacity(total);
 
-        let total = end_dwell + transit + start_dwell;
-        let mut points = Vec::with_capacity(total);
+            // Phase 1: end dwell — blanked at source
+            for _ in 0..end_dwell {
+                points.push(LaserPoint::blanked(from.x, from.y));
+            }
 
-        // Phase 1: end dwell — blanked at source
-        for _ in 0..end_dwell {
-            points.push(LaserPoint::blanked(from.x, from.y));
-        }
+            // Phase 2: transit — quintic ease-in-out from→to, blanked
+            for i in 0..transit {
+                let t = (i as f32 + 1.0) / (transit as f32 + 1.0);
+                let t = quintic_ease_in_out(t);
+                points.push(LaserPoint::blanked(from.x + dx * t, from.y + dy * t));
+            }
 
-        // Phase 2: transit — quintic ease-in-out from→to, blanked
-        for i in 0..transit {
-            let t = (i as f32 + 1.0) / (transit as f32 + 1.0);
-            let t = quintic_ease_in_out(t);
-            points.push(LaserPoint::blanked(from.x + dx * t, from.y + dy * t));
-        }
+            // Phase 3: start dwell — blanked at destination
+            for _ in 0..start_dwell {
+                points.push(LaserPoint::blanked(to.x, to.y));
+            }
 
-        // Phase 3: start dwell — blanked at destination
-        for _ in 0..start_dwell {
-            points.push(LaserPoint::blanked(to.x, to.y));
-        }
-
-        TransitionPlan::Transition(points)
-    })
+            TransitionPlan::Transition(points)
+        },
+    )
 }
 
 /// Quintic ease-in-out: smooth acceleration/deceleration for galvo transit.
