@@ -228,7 +228,9 @@ pub fn list_devices_filtered(enabled_types: &EnabledDacTypes) -> BackendResult<V
 /// - `idn:<hex unit id>:<service index>` (e.g. `idn:0102030405060708090a0b0c0d0e0f10:1`)
 /// - `helios:<slugified device name>` (fallback when the device name is
 ///   unreadable: `helios:usb:<bus>:<port>`)
-/// - `lasercube-network:<mac or ip>` (e.g. `lasercube-network:192.168.1.50`)
+/// - `lasercube-network:<serial>` (hardware serial; falls back to the IP form
+///   when no serial is readable: `lasercube-network:<ip>`, e.g.
+///   `lasercube-network:192.168.1.50`)
 /// - `lasercube-usb:<serial>` (fallback when no serial is readable:
 ///   `lasercube-usb:<bus>:<address>`)
 /// - `avb:<slugified device name>:<index>` (e.g. `avb:motu-avb-main:0`)

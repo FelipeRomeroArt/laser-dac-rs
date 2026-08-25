@@ -246,6 +246,17 @@ impl Drop for StartBackendGuard {
 ///     LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535),
 /// ]));
 /// ```
+///
+/// # Exit reasons
+///
+/// [`join`](FrameSession::join) resolves to one of the
+/// [`SessionExit`] variants once the scheduler thread finishes:
+/// `Stopped` (stop was requested), `ProducerEnded` (unused for frame sessions;
+/// frames are latest-wins, never ended by the producer), `Disconnected`
+/// (the device disconnected and reconnection was unavailable or exhausted),
+/// or `IncompatibleDevice` (a replacement device found during reconnect was
+/// rejected because its backend kind, output model, or PPS range does not
+/// match the running session).
 pub struct FrameSession {
     control: SessionControl,
     thread: Option<JoinHandle<Result<SessionExit>>>,

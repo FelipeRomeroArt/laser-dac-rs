@@ -296,8 +296,9 @@ let exit = stream.run(
 ```
 
 Return `ChunkResult::Filled(n)` to continue, `ChunkResult::Starved` when you have no
-data ready right now (the configured [idle policy](#idle-policy) fills the gap and
-the stream keeps running), or `ChunkResult::End` to stop gracefully.
+data ready right now (the configured [idle policy](#idle-policy) fills the gap —
+note that the `Stop` policy instead ends the run with an error), or
+`ChunkResult::End` to stop gracefully.
 
 ## Coordinate System
 

@@ -5,13 +5,13 @@
 //! here so the real-time-critical invariants are stated and enforced in one
 //! place:
 //!
-//! - [`AudioSinkState`] is the shared producer/consumer core: a
+//! - `AudioSinkState` is the shared producer/consumer core: a
 //!   `crossbeam_queue::ArrayQueue` plus atomics only. Everything inside the
 //!   cpal audio callback must be wait-free — no `Mutex`, no allocation, no
 //!   blocking syscalls.
-//! - [`RunningAudioStream`] / [`CpalStreamHandle`] are the tiny lifecycle seam
+//! - `RunningAudioStream` / `CpalStreamHandle` are the tiny lifecycle seam
 //!   that keeps the non-`Send` cpal stream on its owning thread.
-//! - [`push_chunk_resampled`] implements the take-and-restore scratch
+//! - `push_chunk_resampled` implements the take-and-restore scratch
 //!   discipline so the hot write path stays allocation-free in steady state.
 //!
 //! What is deliberately *not* consolidated: device enumeration/config
