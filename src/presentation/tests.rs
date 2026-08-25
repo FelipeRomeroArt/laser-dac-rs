@@ -4013,6 +4013,89 @@ fn test_frame_session_blocking_fifo_reconnect_clears_ring() {
     drop(session);
 }
 
+/// Discoverer that hands back a FIFO backend with a *different* output model
+/// (NetworkFifo) than the original device (BlockingFifo) but a fully
+/// compatible PPS range — used to prove the frame session rejects an
+/// output-model swap on reconnect instead of silently re-pacing through the
+/// old adapter.
+struct ModelSwapDiscoverer;
+
+impl crate::discovery::Discoverer for ModelSwapDiscoverer {
+    fn dac_type(&self) -> crate::device::DacType {
+        crate::device::DacType::Custom("ModelSwapFifo".into())
+    }
+
+    fn prefix(&self) -> &str {
+        "modelswapfifo"
+    }
+
+    fn scan(&mut self) -> Vec<crate::discovery::DiscoveredDevice> {
+        let info = crate::discovery::DiscoveredDeviceInfo::new(
+            crate::device::DacType::Custom("ModelSwapFifo".into()),
+            "modelswapfifo:10.0.0.101",
+            "Model Swap Fifo",
+        );
+        vec![crate::discovery::DiscoveredDevice::new(info, Box::new(()))]
+    }
+
+    fn connect(&mut self, _opaque: Box<dyn std::any::Any + Send>) -> DacResult<BackendKind> {
+        // FifoTestBackend exposes NetworkFifo caps with pps range
+        // [1000, 100000] — compatible PPS, incompatible output model.
+        Ok(BackendKind::Fifo(Box::new(FifoTestBackend::new())))
+    }
+}
+
+#[test]
+fn test_frame_session_rejects_output_model_swap_on_reconnect() {
+    use crate::config::ReconnectConfig;
+    use crate::device::{DacInfo, DacType};
+    use crate::stream::Dac;
+
+    // Initial BlockingFifo backend disconnects after its first write, forcing
+    // a reconnect to the ModelSwapDiscoverer replacement.
+    let initial_backend = DisconnectAfterNBlockingFifoBackend::new(1);
+    let info = DacInfo {
+        id: "modelswapfifo:10.0.0.101".to_string(),
+        name: "Model Swap Fifo".to_string(),
+        kind: DacType::Custom("ModelSwapFifo".to_string()),
+        caps: initial_backend.caps().clone(),
+    };
+    let device = Dac::new(info, BackendKind::Fifo(Box::new(initial_backend)))
+        .with_discovery_factory(move || {
+            let mut discovery =
+                crate::discovery::DacDiscovery::new(crate::device::EnabledDacTypes::none());
+            discovery.register(Box::new(ModelSwapDiscoverer));
+            discovery
+        });
+
+    let config = FrameSessionConfig::new(30_000)
+        .with_transition_fn(Box::new(|_: &LaserPoint, _: &LaserPoint, _| {
+            TransitionPlan::Transition(vec![])
+        }))
+        .with_startup_blank(std::time::Duration::ZERO)
+        .with_color_delay(std::time::Duration::ZERO)
+        .with_reconnect(
+            ReconnectConfig::new()
+                .max_retries(3)
+                .backoff(std::time::Duration::from_millis(20)),
+        );
+
+    let (session, _info) = device.start_frame_session(config).unwrap();
+    session.control().arm().unwrap();
+    session.send_frame(Frame::new(vec![make_point(1.0, 0.0)]));
+
+    // The replacement's PPS range covers the 30 kpps config, so the only
+    // reason to reject it is the output-model change - same terminal
+    // IncompatibleDevice exit as every other rejected swap.
+    let exit = session.join().unwrap();
+    assert_eq!(
+        exit,
+        SessionExit::IncompatibleDevice,
+        "a FIFO replacement with a different OutputModel must be rejected even \
+         when its PPS range is compatible"
+    );
+}
+
 #[test]
 fn test_engine_reset_clears_state() {
     use super::engine::PresentationEngine;

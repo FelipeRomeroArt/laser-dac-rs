@@ -416,7 +416,8 @@ impl FrameSession {
             SourceOwned::Fifo(Box::new(pipeline))
         };
 
-        let validator = Self::reconnect_validator(reconnect_policy.as_ref());
+        let expected_output_model = backend.caps().output_model.clone();
+        let validator = Self::reconnect_validator(reconnect_policy.as_ref(), expected_output_model);
         if !backend.is_connected() {
             backend.connect()?;
         }
@@ -444,11 +445,31 @@ impl FrameSession {
         })
     }
 
-    fn reconnect_validator(policy: Option<&ReconnectPolicy>) -> driver::ReconnectValidator {
+    /// Build the frame-session reconnect validator.
+    ///
+    /// `expected_output_model` is the original device's output model. The
+    /// pacing adapter is chosen once from it when the driver starts
+    /// (`output_model::for_backend`) and is NOT recreated on reconnect, so a
+    /// replacement device exposing a different model would silently keep the
+    /// old pacing strategy against a new transport — reject the swap instead.
+    fn reconnect_validator(
+        policy: Option<&ReconnectPolicy>,
+        expected_output_model: OutputModel,
+    ) -> driver::ReconnectValidator {
         let target_id = policy
             .map(|p| p.target.device_id.clone())
             .unwrap_or_default();
-        Box::new(move |info: &DacInfo, _backend: &BackendKind, pps: u32| {
+        Box::new(move |info: &DacInfo, new_backend: &BackendKind, pps: u32| {
+            if new_backend.caps().output_model != expected_output_model {
+                log::error!(
+                    "'{}' reconnected device output model {:?} differs from original {:?}; \
+                     the pacing adapter cannot be swapped mid-session",
+                    target_id,
+                    new_backend.caps().output_model,
+                    expected_output_model
+                );
+                return Err(SessionExit::IncompatibleDevice);
+            }
             if pps < info.caps.pps_min || pps > info.caps.pps_max {
                 log::error!(
                     "'{}' PPS {} outside new device range [{}, {}]",
