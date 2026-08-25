@@ -243,11 +243,13 @@ impl IdnBackend {
 
     /// Convert `points` into the selected wire format, reusing a pooled buffer
     /// when one is available, and defensively clamp `pps` to the device's
-    /// maximum rate. [`SessionControl::set_pps`](crate::SessionControl::set_pps)
+    /// supported rate range. [`SessionControl::set_pps`](crate::SessionControl::set_pps)
     /// validates runtime changes; this backend boundary remains a final guard
     /// for direct/internal callers (mirroring the other backends' clamping).
     fn build_chunk(&self, pps: u32, points: &[LaserPoint]) -> QueuedChunk {
-        let pps = pps.min(self.caps.pps_max);
+        // Mirror `clamp_point_rate` in the lasercube-network backend: floor at
+        // the device minimum (at least 1) as well as capping at the maximum.
+        let pps = pps.clamp(self.caps.pps_min.max(1), self.caps.pps_max);
         let chunk_points = match self.point_format {
             PointFormat::Xyrgbi => {
                 let mut buf = self.pool.take_xyrgbi();
@@ -782,6 +784,29 @@ mod tests {
 
         let in_range = backend.build_chunk(30_000, &[LaserPoint::blanked(0.0, 0.0)]);
         assert_eq!(in_range.pps, 30_000);
+    }
+
+    /// The lower end of the range is clamped too: a zero (or sub-minimum) rate
+    /// supplied directly to the backend must never reach the worker as an
+    /// invalid device rate (mirroring the lasercube-network clamp).
+    #[test]
+    fn build_chunk_clamps_below_device_minimum() {
+        let backend = test_backend();
+        let caps = super::super::default_capabilities();
+        assert_eq!(caps.pps_min, 1);
+
+        for requested in [0, u32::MAX] {
+            let chunk = backend.build_chunk(requested, &[LaserPoint::blanked(0.0, 0.0)]);
+            // Zero clamps up to pps_min; u32::MAX still clamps down to pps_max.
+            let expected = requested.clamp(caps.pps_min.max(1), caps.pps_max);
+            assert_eq!(
+                chunk.pps,
+                expected,
+                "requested {requested} must clamp into [{}, {}]",
+                caps.pps_min.max(1),
+                caps.pps_max
+            );
+        }
     }
 
     #[test]
