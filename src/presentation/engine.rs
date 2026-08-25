@@ -2,7 +2,7 @@
 
 use crate::point::LaserPoint;
 
-use super::{Frame, TransitionFn, TransitionPlan};
+use super::{Frame, TransitionContext, TransitionFn, TransitionPlan};
 
 // =============================================================================
 // PresentationEngine
@@ -41,6 +41,10 @@ pub struct PresentationEngine {
     transition_is_self_loop: bool,
     /// Length of the transition prefix in the last composed frame-swap drawable.
     frame_swap_transition_len: usize,
+    /// PPS used to compose the cached frame-swap drawable. A runtime rate
+    /// change invalidates steady self-loop composition after the in-flight
+    /// SlicePipeline cache has been committed.
+    frame_swap_composed_pps: Option<u32>,
     /// Maximum hardware frame capacity (frame-swap only). When set, composed
     /// frames are clamped by first trimming the generated transition prefix,
     /// then—only if the authored points still exceed capacity—truncating the tail.
@@ -67,6 +71,7 @@ impl PresentationEngine {
             transition_cursor: 0,
             transition_is_self_loop: false,
             frame_swap_transition_len: 0,
+            frame_swap_composed_pps: None,
             frame_capacity: None,
             idle_blank: LaserPoint::blanked(0.0, 0.0),
         }
@@ -95,6 +100,7 @@ impl PresentationEngine {
         self.transition_cursor = 0;
         self.transition_is_self_loop = false;
         self.frame_swap_transition_len = 0;
+        self.frame_swap_composed_pps = None;
     }
 
     /// Returns true once a logical frame has been submitted to the engine.
@@ -127,8 +133,9 @@ impl PresentationEngine {
     ///
     /// Returns the number of points written (always `max_points` if a
     /// frame is available, 0 if no frame has been submitted).
-    pub fn fill_chunk(&mut self, buffer: &mut [LaserPoint], max_points: usize) -> usize {
+    pub fn fill_chunk(&mut self, buffer: &mut [LaserPoint], max_points: usize, pps: u32) -> usize {
         let max_points = max_points.min(buffer.len());
+        let transition_context = TransitionContext { pps };
 
         // Rebuild drawable if dirty (no-op when current_base is None)
         if self.drawable_dirty {
@@ -159,7 +166,7 @@ impl PresentationEngine {
                 {
                     self.transition_buf.clear();
                     self.transition_is_self_loop = false;
-                    self.promote_pending();
+                    self.promote_pending(&transition_context);
 
                     if self.drawable.is_empty() {
                         buffer[written..max_points].fill(self.idle_blank);
@@ -187,7 +194,7 @@ impl PresentationEngine {
             // At the seam: compute transition dynamically against pending or self
             if self.cursor >= self.drawable.len() {
                 if self.pending_base.is_some() {
-                    self.promote_pending();
+                    self.promote_pending(&transition_context);
 
                     if self.drawable.is_empty() {
                         buffer[written..max_points].fill(self.idle_blank);
@@ -199,7 +206,7 @@ impl PresentationEngine {
                     // direct copy of current_base.points(), so these unwraps are safe.
                     let last = self.drawable.last().unwrap();
                     let first = self.drawable.first().unwrap();
-                    match (self.transition_fn)(last, first) {
+                    match (self.transition_fn)(last, first, &transition_context) {
                         TransitionPlan::Transition(points) => {
                             self.transition_buf = points;
                             self.transition_cursor = 0;
@@ -225,7 +232,8 @@ impl PresentationEngine {
     ///
     /// On self-loop (no pending): computes `transition_fn(A.last, A.first)`,
     /// composes `[transition | A_points]` (or coalesced).
-    pub fn compose_hardware_frame(&mut self) -> &[LaserPoint] {
+    pub fn compose_hardware_frame(&mut self, pps: u32) -> &[LaserPoint] {
+        let transition_context = TransitionContext { pps };
         if let Some(pending) = self.pending_base.take() {
             // Frame change: A→B transition.
             // Compute transition from current (A) to pending (B) BEFORE promoting.
@@ -233,7 +241,7 @@ impl PresentationEngine {
                 self.current_base.as_ref().and_then(|c| c.last_point()),
                 pending.first_point(),
             ) {
-                (Some(last), Some(first)) => (self.transition_fn)(last, first),
+                (Some(last), Some(first)) => (self.transition_fn)(last, first, &transition_context),
                 _ => TransitionPlan::Transition(vec![]),
             };
 
@@ -260,6 +268,7 @@ impl PresentationEngine {
             }
 
             self.clamp_to_capacity();
+            self.frame_swap_composed_pps = Some(pps);
 
             // Promote B to current. Mark dirty so next call builds self-loop.
             self.current_base = Some(pending);
@@ -268,9 +277,10 @@ impl PresentationEngine {
             return &self.drawable;
         }
 
-        // No pending: self-loop for current frame.
-        if self.drawable_dirty {
-            self.refresh_drawable_for_frame_swap();
+        // No pending: self-loop for current frame. Runtime PPS participates in
+        // composition because transition dwell counts may depend on it.
+        if self.drawable_dirty || self.frame_swap_composed_pps != Some(pps) {
+            self.refresh_drawable_for_frame_swap(&transition_context);
         }
 
         &self.drawable
@@ -282,10 +292,11 @@ impl PresentationEngine {
     /// transition from last→first point is included for clean looping.
     /// For nearly-closed shapes (circles), `Coalesce` omits the last base
     /// point so the frame loops seamlessly without a duplicate seam point.
-    fn refresh_drawable_for_frame_swap(&mut self) {
+    fn refresh_drawable_for_frame_swap(&mut self, transition_context: &TransitionContext) {
         self.drawable.clear();
         self.drawable_dirty = false;
         self.frame_swap_transition_len = 0;
+        self.frame_swap_composed_pps = Some(transition_context.pps);
 
         let Some(current) = &self.current_base else {
             return;
@@ -297,8 +308,12 @@ impl PresentationEngine {
         }
 
         let points = current.points();
-        self.frame_swap_transition_len =
-            build_self_loop_drawable(&self.transition_fn, points, &mut self.drawable);
+        self.frame_swap_transition_len = build_self_loop_drawable(
+            &self.transition_fn,
+            points,
+            &mut self.drawable,
+            transition_context,
+        );
         self.clamp_to_capacity();
     }
 
@@ -335,14 +350,14 @@ impl PresentationEngine {
     ///
     /// Computes the A→B transition, promotes the pending frame, rebuilds
     /// the drawable, and sets the cursor appropriately.
-    fn promote_pending(&mut self) {
+    fn promote_pending(&mut self, transition_context: &TransitionContext) {
         let pending = self.pending_base.take().unwrap();
 
         let plan = match (
             self.current_base.as_ref().and_then(|f| f.last_point()),
             pending.first_point(),
         ) {
-            (Some(last), Some(first)) => (self.transition_fn)(last, first),
+            (Some(last), Some(first)) => (self.transition_fn)(last, first, transition_context),
             _ => TransitionPlan::Transition(vec![]),
         };
 
@@ -420,10 +435,11 @@ fn build_self_loop_drawable(
     transition_fn: &TransitionFn,
     base: &[LaserPoint],
     drawable: &mut Vec<LaserPoint>,
+    transition_context: &TransitionContext,
 ) -> usize {
     let last = base.last().unwrap();
     let first = base.first().unwrap();
-    let plan = transition_fn(last, first);
+    let plan = transition_fn(last, first, transition_context);
 
     match plan {
         TransitionPlan::Transition(pts) => {
@@ -570,18 +586,18 @@ mod tests {
     fn oversized_authored_frame_is_truncated_to_capacity() {
         const CAP: usize = 4_095;
         // Transition function returns a 10-point prefix.
-        let mut engine = PresentationEngine::new(Box::new(|_, _| {
+        let mut engine = PresentationEngine::new(Box::new(|_, _, _| {
             TransitionPlan::Transition(vec![LaserPoint::blanked(0.0, 0.0); 10])
         }));
         engine.set_frame_capacity(Some(CAP));
 
         // Prime a current frame so the swap computes an A->B transition.
         engine.set_pending(frame_of(4));
-        let _ = engine.compose_hardware_frame();
+        let _ = engine.compose_hardware_frame(30_000);
 
         // Now swap in an over-capacity authored frame.
         engine.set_pending(frame_of(5_000));
-        let composed = engine.compose_hardware_frame();
+        let composed = engine.compose_hardware_frame(30_000);
         assert_eq!(
             composed.len(),
             CAP,
@@ -595,13 +611,13 @@ mod tests {
     #[test]
     fn idle_blank_point_used_for_no_content_and_empty_frame() {
         let mut engine =
-            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+            PresentationEngine::new(Box::new(|_, _, _| TransitionPlan::Transition(Vec::new())));
         let park = LaserPoint::blanked(0.25, -0.5);
         engine.set_idle_blank_point(park);
 
         // No frame yet: fill holds the idle-blank point.
         let mut buf = vec![LaserPoint::default(); 4];
-        assert_eq!(engine.fill_chunk(&mut buf, 4), 4);
+        assert_eq!(engine.fill_chunk(&mut buf, 4, 30_000), 4);
         assert!(buf.iter().all(|p| p.x == park.x && p.y == park.y));
 
         // Empty frame ("clear the display") reports a logical frame but no
@@ -609,7 +625,7 @@ mod tests {
         engine.set_pending(Frame::new(Vec::new()));
         assert!(engine.has_logical_frame());
         let mut buf = vec![LaserPoint::default(); 4];
-        assert_eq!(engine.fill_chunk(&mut buf, 4), 4);
+        assert_eq!(engine.fill_chunk(&mut buf, 4, 30_000), 4);
         assert!(buf.iter().all(|p| p.x == park.x && p.y == park.y));
     }
 
@@ -617,7 +633,7 @@ mod tests {
     /// with the idle-blank point rather than the origin.
     #[test]
     fn idle_blank_point_used_for_midchunk_empty_promotion() {
-        let mut engine = PresentationEngine::new(Box::new(|_, _| TransitionPlan::Coalesce));
+        let mut engine = PresentationEngine::new(Box::new(|_, _, _| TransitionPlan::Coalesce));
         let park = LaserPoint::blanked(0.1, 0.2);
         engine.set_idle_blank_point(park);
 
@@ -628,9 +644,29 @@ mod tests {
         // Ask for more points than the current frame holds so the seam is hit
         // and the empty pending frame is promoted, blanking the tail to park.
         let mut buf = vec![LaserPoint::default(); 8];
-        assert_eq!(engine.fill_chunk(&mut buf, 8), 8);
+        assert_eq!(engine.fill_chunk(&mut buf, 8, 30_000), 8);
         // The tail (after the current frame drains) must be the idle-blank point.
         assert!(buf[2..].iter().all(|p| p.x == park.x && p.y == park.y));
+    }
+
+    #[test]
+    fn frame_swap_self_loop_recomposes_when_runtime_pps_changes() {
+        let mut engine = PresentationEngine::new(Box::new(|_, _, context| {
+            TransitionPlan::Transition(vec![
+                LaserPoint::blanked(0.0, 0.0);
+                (context.pps / 1_000) as usize
+            ])
+        }));
+        engine.set_pending(frame_of(2));
+
+        let at_one_kpps = engine.compose_hardware_frame(1_000).to_vec();
+        assert_eq!(at_one_kpps.len(), 3);
+
+        // No pending frame: a newly produced steady self-loop must still use
+        // the new runtime rate when composing transition dwell points.
+        let at_two_kpps = engine.compose_hardware_frame(2_000).to_vec();
+        assert_eq!(at_two_kpps.len(), 4);
+        assert_ne!(at_one_kpps, at_two_kpps);
     }
 
     /// The self-loop (no pending) refresh path must also clamp an over-capacity
@@ -638,14 +674,14 @@ mod tests {
     #[test]
     fn oversized_self_loop_frame_is_truncated_to_capacity() {
         const CAP: usize = 4_095;
-        let mut engine = PresentationEngine::new(Box::new(|_, _| {
+        let mut engine = PresentationEngine::new(Box::new(|_, _, _| {
             TransitionPlan::Transition(vec![LaserPoint::blanked(0.0, 0.0); 10])
         }));
         engine.set_frame_capacity(Some(CAP));
 
         engine.set_pending(frame_of(5_000));
-        let _ = engine.compose_hardware_frame(); // frame-change path
-        let composed = engine.compose_hardware_frame(); // self-loop refresh
+        let _ = engine.compose_hardware_frame(30_000); // frame-change path
+        let composed = engine.compose_hardware_frame(30_000); // self-loop refresh
         assert_eq!(composed.len(), CAP);
     }
 }

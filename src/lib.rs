@@ -110,6 +110,7 @@ pub mod receiver;
 pub(crate) mod reconnect;
 #[cfg(any(feature = "avb", feature = "oscilloscope"))]
 pub(crate) mod resample;
+pub mod session;
 pub mod stream;
 pub mod types;
 
@@ -138,15 +139,16 @@ pub use device::{
 pub use config::{IdlePolicy, ReconnectConfig, StreamConfig};
 
 // Stream and Dac types
+pub use session::{SessionControl, SessionExit};
 pub use stream::{
-    ChunkRequest, ChunkResult, Dac, RunExit, Stream, StreamControl, StreamInstant, StreamStats,
-    StreamStatus,
+    ChunkRequest, ChunkResult, Dac, Stream, StreamInstant, StreamStats, StreamStatus,
 };
 
 // Presentation types (frame-first API)
 pub use presentation::{
     default_transition, Frame, FrameSession, FrameSessionConfig, FrameSessionMetrics, OutputFilter,
-    OutputFilterContext, OutputResetReason, PresentedSliceKind, TransitionFn, TransitionPlan,
+    OutputFilterContext, OutputResetReason, PresentedSliceKind, TransitionContext, TransitionFn,
+    TransitionPlan,
 };
 
 // Conditional exports based on features

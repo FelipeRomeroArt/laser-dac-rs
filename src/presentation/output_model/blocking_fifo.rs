@@ -28,7 +28,7 @@ use crate::backend::{BackendKind, WriteOutcome};
 use crate::device::DacInfo;
 
 use super::super::content_source::ContentSourceKind;
-use super::{LoopCtx, OutputModelAdapter, StepOutcome};
+use super::{close_if_disarmed, LoopCtx, OutputModelAdapter, StepOutcome};
 
 /// Points per blocking write. 512 = 8 × the LaserDock bulk packet (64) and
 /// ≈17ms at 30kpps — comfortably above the ring drain rate (no underruns) while
@@ -45,8 +45,6 @@ pub(crate) struct BlockingFifoAdapter {
     /// True while a produced-but-unwritten slice is held in the source cache
     /// (retain-on-`WouldBlock`).
     has_retain: bool,
-    /// Tracks the armed edge so the ring can be cleared exactly once on re-arm.
-    was_armed: bool,
 }
 
 impl BlockingFifoAdapter {
@@ -54,7 +52,6 @@ impl BlockingFifoAdapter {
         Self {
             chunk_points: CHUNK_POINTS.min(backend.caps().max_points_per_chunk),
             has_retain: false,
-            was_armed: false,
         }
     }
 }
@@ -65,34 +62,19 @@ impl OutputModelAdapter for BlockingFifoAdapter {
         // blocking write would wedge. Idle (processing control messages) until
         // re-armed.
         if !ctx.is_armed {
-            self.was_armed = false;
             if let Err(stopped) = ctx.sleep_with_control_check(IDLE_SLEEP) {
                 return stopped;
             }
             return StepOutcome::Continue;
         }
 
-        // Rising arm edge: the ring still holds whatever was queued before the
-        // disarm (the device never consumed it). Clear it so stale points don't
-        // replay, and drop any slice retained from before the gap.
-        // The adapter/source pairing is validated once at construction
-        // (`for_backend`); this guard keeps any future wiring mistake a
-        // reported error instead of a panic.
+        // The adapter/source pairing is validated once at construction.
         let source = match &mut ctx.source {
             ContentSourceKind::Fifo(s) => s,
             ContentSourceKind::Frame(_) => {
                 return super::source_mismatch(ctx, "BlockingFifoAdapter");
             }
         };
-
-        if !self.was_armed {
-            self.was_armed = true;
-            if let Err(e) = ctx.backend.reset_device_buffer() {
-                log::debug!("reset_device_buffer on re-arm failed (non-fatal): {e}");
-            }
-            source.discard_cached();
-            self.has_retain = false;
-        }
 
         let pps = ctx.pps;
         let chunk = self.chunk_points;
@@ -133,6 +115,10 @@ impl OutputModelAdapter for BlockingFifoAdapter {
                 if ctx.control.is_stop_requested() {
                     return StepOutcome::Stopped;
                 }
+                close_if_disarmed(ctx.control, ctx.shutter_open, ctx.backend);
+                if !ctx.control.is_armed() {
+                    return StepOutcome::StateChanged;
+                }
                 ctx.sleep_and_mark_activity(Duration::from_micros(100));
             }
             Err(e) if e.is_stopped() => return StepOutcome::Stopped,
@@ -153,8 +139,10 @@ impl OutputModelAdapter for BlockingFifoAdapter {
     fn on_reconnect(&mut self, info: &DacInfo, _backend: &mut BackendKind) {
         self.chunk_points = CHUNK_POINTS.min(info.caps.max_points_per_chunk);
         self.has_retain = false;
-        // Force a ring clear on the first armed step after reconnect.
-        self.was_armed = false;
+    }
+
+    fn on_state_change(&mut self, _armed: bool) {
+        self.has_retain = false;
     }
 
     fn drain_and_blank(&mut self, ctx: &mut LoopCtx<'_>, timeout: Duration) {
@@ -193,7 +181,7 @@ mod tests {
     use crate::presentation::session::FrameSessionMetrics;
     use crate::presentation::slice_pipeline::SlicePipeline;
     use crate::presentation::{Frame, TransitionPlan};
-    use crate::stream::{ControlMsg, StreamControl};
+    use crate::session::{ControlMsg, SessionControl};
 
     use super::{BlockingFifoAdapter, CHUNK_POINTS};
 
@@ -267,10 +255,10 @@ mod tests {
         backend: BackendKind,
         adapter: BlockingFifoAdapter,
         pipeline: SlicePipeline,
-        control: StreamControl,
+        control: SessionControl,
         rx: mpsc::Receiver<ControlMsg>,
         metrics: FrameSessionMetrics,
-        shutter: bool,
+        shutter: crate::presentation::output_model::ShutterState,
         writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
         resets: Arc<AtomicUsize>,
     }
@@ -289,12 +277,18 @@ mod tests {
             let adapter = BlockingFifoAdapter::new(&backend);
 
             let mut engine =
-                PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+                PresentationEngine::new(Box::new(|_, _, _| TransitionPlan::Transition(Vec::new())));
             engine.set_pending(frame_with_points(474));
-            let pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+            let pipeline = SlicePipeline::new(
+                engine,
+                std::time::Duration::ZERO,
+                None,
+                IdlePolicy::Blank,
+                0,
+            );
 
             let (tx, rx) = mpsc::channel::<ControlMsg>();
-            let control = StreamControl::new(tx, std::time::Duration::ZERO, 30_000);
+            let control = SessionControl::new(tx, std::time::Duration::ZERO, 30_000);
             let metrics = FrameSessionMetrics::new(true);
             Self {
                 backend,
@@ -303,7 +297,7 @@ mod tests {
                 control,
                 rx,
                 metrics,
-                shutter: false,
+                shutter: crate::presentation::output_model::ShutterState::Closed,
                 writes,
                 resets,
             }
@@ -371,21 +365,16 @@ mod tests {
     }
 
     #[test]
-    fn rearm_clears_ring_exactly_once_per_edge() {
+    fn adapter_does_not_duplicate_shared_arm_reset() {
         let mut h = Harness::new();
-        // First armed step: rising edge from the initial disarmed state → clear.
         h.step(true);
-        assert_eq!(h.resets.load(Ordering::SeqCst), 1);
-        // Staying armed does not re-clear.
         h.step(true);
-        assert_eq!(h.resets.load(Ordering::SeqCst), 1);
-        // Disarm, then re-arm: a second clear on the new rising edge.
         h.step(false);
         h.step(true);
         assert_eq!(
             h.resets.load(Ordering::SeqCst),
-            2,
-            "ring should be cleared once per re-arm, not per armed step"
+            0,
+            "ring reset belongs exclusively to the shared lifecycle driver"
         );
     }
 
@@ -443,14 +432,20 @@ mod tests {
         let mut backend = BackendKind::Fifo(Box::new(backend));
 
         let mut engine =
-            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+            PresentationEngine::new(Box::new(|_, _, _| TransitionPlan::Transition(Vec::new())));
         engine.set_pending(frame_with_points(64));
-        let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+        let mut pipeline = SlicePipeline::new(
+            engine,
+            std::time::Duration::ZERO,
+            None,
+            IdlePolicy::Blank,
+            0,
+        );
 
         let (tx, rx) = mpsc::channel::<ControlMsg>();
-        let control = StreamControl::new(tx, std::time::Duration::ZERO, CONFIGURED_PPS);
+        let control = SessionControl::new(tx, std::time::Duration::ZERO, CONFIGURED_PPS);
         let metrics = FrameSessionMetrics::new(true);
-        let mut shutter = true;
+        let mut shutter = crate::presentation::output_model::ShutterState::Open;
 
         let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
         let mut ctx = LoopCtx {

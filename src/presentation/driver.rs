@@ -17,11 +17,12 @@ use crate::backend::BackendKind;
 use crate::device::DacInfo;
 use crate::error::{Error, Result};
 use crate::reconnect::{reconnect_backend_with_retry, ReconnectPolicy};
-use crate::stream::{ControlMsg, RunExit, StreamControl};
+use crate::session::{ControlMsg, SessionControl, SessionExit};
 
 use super::content_source::{ContentSourceKind, FifoContentSource, FrameContentSource};
 use super::output_model::{
-    self, process_control_messages, Clock, LoopCtx, OutputModelAdapter, StepOutcome, SystemClock,
+    self, process_control_messages, Clock, ControlAction, LoopCtx, OutputModelAdapter,
+    ShutterState, StepOutcome, SystemClock,
 };
 use super::session::FrameSessionMetrics;
 use super::OutputResetReason;
@@ -78,6 +79,13 @@ impl SourceOwned {
         }
     }
 
+    fn discard_cached(&mut self) {
+        match self {
+            SourceOwned::Fifo(s) => s.discard_cached(),
+            SourceOwned::Frame(s) => s.discard_cached(),
+        }
+    }
+
     fn on_disarm(&mut self) {
         match self {
             SourceOwned::Fifo(s) => s.on_disarm(),
@@ -92,10 +100,10 @@ impl SourceOwned {
         }
     }
 
-    fn resize_color_delay_micros(&mut self, micros: u64, pps: u32) {
+    fn set_color_delay(&mut self, delay: Duration) {
         match self {
-            SourceOwned::Fifo(s) => s.resize_color_delay_micros(micros, pps),
-            SourceOwned::Frame(s) => s.resize_color_delay_micros(micros, pps),
+            SourceOwned::Fifo(s) => s.set_color_delay(delay),
+            SourceOwned::Frame(s) => s.set_color_delay(delay),
         }
     }
 
@@ -111,18 +119,18 @@ impl SourceOwned {
 pub(crate) type PendingFrame = Arc<Mutex<Option<super::Frame>>>;
 
 /// Result of the reconnect-validator closure: `Ok(())` accepts the swap,
-/// `Err(RunExit::...)` rejects with the given exit reason.
+/// `Err(SessionExit::...)` rejects with the given exit reason.
 pub(crate) type ReconnectValidator =
-    Box<dyn Fn(&DacInfo, &BackendKind, u32) -> std::result::Result<(), RunExit> + Send>;
+    Box<dyn Fn(&DacInfo, &BackendKind, u32) -> std::result::Result<(), SessionExit> + Send>;
 
 /// Sink for non-fatal write errors. Stream-mode threads the user's
-/// `on_error`; frame-mode logs each error as a warning.
+/// `on_error`; frame-mode passes a no-op.
 pub(crate) type ErrorSink = Box<dyn FnMut(Error) + Send>;
 
 pub(crate) struct DriverInputs {
     pub backend: BackendKind,
     pub source: SourceOwned,
-    pub control: StreamControl,
+    pub control: SessionControl,
     pub control_rx: Receiver<ControlMsg>,
     pub metrics: FrameSessionMetrics,
     pub reconnect_policy: Option<ReconnectPolicy>,
@@ -150,10 +158,15 @@ impl DriverInputs {
 
 /// The unified driver loop. Lifted from the old `FrameSession::run_loop`,
 /// generalised to either content source.
-pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
+pub(crate) fn run(mut inputs: DriverInputs) -> Result<SessionExit> {
     let expected_frame_swap = inputs.source.is_frame();
-    let mut adapter = output_model::for_backend(&inputs.backend, expected_frame_swap)?;
-
+    let mut adapter = match output_model::for_backend(&inputs.backend, expected_frame_swap) {
+        Ok(adapter) => adapter,
+        Err(err) => {
+            inputs.backend.close_and_disconnect();
+            return Err(err);
+        }
+    };
     let mut state = LoopState::default();
 
     loop {
@@ -161,15 +174,12 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
         if inputs.control.is_stop_requested() {
             return Ok(stop_and_close_shutter(
                 &mut inputs.backend,
-                &mut state.shutter_open,
+                &mut state.shutter_state,
             ));
         }
 
         let pps = inputs.control.pps();
-        let color_delay_micros = inputs.control.color_delay().as_micros() as u64;
-        inputs
-            .source
-            .resize_color_delay_micros(color_delay_micros, pps);
+        inputs.source.set_color_delay(inputs.control.color_delay());
         if let Some(slot) = inputs.pending_frame.as_ref() {
             // Poisoning policy: a frame slot is latest-wins state; recover via
             // `into_inner` instead of propagating a scheduler panic to callers.
@@ -185,25 +195,33 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
             }
         }
 
-        if process_control_messages(
-            &inputs.control_rx,
-            &mut state.shutter_open,
-            &mut inputs.backend,
+        if matches!(
+            process_control_messages(&inputs.control_rx),
+            ControlAction::Stop
         ) {
             return Ok(stop_and_close_shutter(
                 &mut inputs.backend,
-                &mut state.shutter_open,
+                &mut state.shutter_state,
             ));
         }
+        if matches!(
+            handle_shutter_transition(
+                &inputs.control,
+                &mut state.handled_state,
+                &mut state.shutter_state,
+                &mut inputs.backend,
+                &mut inputs.source,
+                &mut *adapter,
+                pps,
+            ),
+            TransitionOutcome::Disconnected
+        ) {
+            match reconnect(&mut inputs, &mut *adapter, &mut state) {
+                Ok(()) => continue,
+                Err(exit) => return Ok(exit),
+            }
+        }
         let is_armed = inputs.control.is_armed();
-        handle_shutter_transition(
-            is_armed,
-            &mut state.last_armed,
-            &mut state.shutter_open,
-            &mut inputs.backend,
-            &mut inputs.source,
-            pps,
-        );
 
         let outcome = {
             let source = inputs.source.as_kind();
@@ -213,7 +231,7 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
                 control: &inputs.control,
                 control_rx: &inputs.control_rx,
                 metrics: &inputs.metrics,
-                shutter_open: &mut state.shutter_open,
+                shutter_open: &mut state.shutter_state,
                 error_sink: &mut inputs.error_sink,
                 target_buffer: inputs.target_buffer,
                 pps,
@@ -224,11 +242,11 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
         };
 
         match outcome {
-            StepOutcome::Continue => {}
+            StepOutcome::Continue | StepOutcome::StateChanged => {}
             StepOutcome::Stopped => {
                 return Ok(stop_and_close_shutter(
                     &mut inputs.backend,
-                    &mut state.shutter_open,
+                    &mut state.shutter_state,
                 ))
             }
             StepOutcome::Disconnected => match reconnect(&mut inputs, &mut *adapter, &mut state) {
@@ -239,6 +257,9 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
 
         if inputs.source.is_ended() {
             if let Some(err) = inputs.source.take_stop_error() {
+                // IdlePolicy::Stop is an abrupt error exit, so it must use the
+                // same explicit ShutterState safety path as a control stop.
+                command_close(&mut inputs.backend, &mut state.shutter_state, true);
                 return Err(err);
             }
             let mut ctx = LoopCtx {
@@ -247,7 +268,7 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
                 control: &inputs.control,
                 control_rx: &inputs.control_rx,
                 metrics: &inputs.metrics,
-                shutter_open: &mut state.shutter_open,
+                shutter_open: &mut state.shutter_state,
                 error_sink: &mut inputs.error_sink,
                 target_buffer: inputs.target_buffer,
                 pps,
@@ -255,29 +276,37 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
                 clock: &*inputs.clock,
             };
             adapter.drain_and_blank(&mut ctx, inputs.drain_timeout);
-            return Ok(RunExit::ProducerEnded);
+            return Ok(SessionExit::ProducerEnded);
         }
     }
 }
 
 /// Loop-local mutable state threaded through the driver's reconnect path.
-#[derive(Default)]
 struct LoopState {
-    /// Whether the hardware shutter is currently open.
-    shutter_open: bool,
-    /// Whether the previous iteration saw an armed control handle (drives
-    /// arm/disarm shutter transitions).
-    last_armed: bool,
+    /// Confirmed state of the hardware shutter.
+    shutter_state: ShutterState,
+    /// Last arm/disarm generation fully handled by the hardware lifecycle.
+    handled_state: crate::session::DesiredState,
     /// Instant the last reconnect completed; gates the flapping-device backoff
     /// floor in `reconnect_backend_with_retry`.
     last_reconnect_at: Option<Instant>,
+}
+
+impl Default for LoopState {
+    fn default() -> Self {
+        Self {
+            shutter_state: ShutterState::Closed,
+            handled_state: crate::session::DesiredState::initial(),
+            last_reconnect_at: None,
+        }
+    }
 }
 
 fn reconnect(
     inputs: &mut DriverInputs,
     adapter: &mut dyn OutputModelAdapter,
     state: &mut LoopState,
-) -> std::result::Result<(), RunExit> {
+) -> std::result::Result<(), SessionExit> {
     let expected_frame_swap = inputs.source.is_frame();
     let DriverInputs {
         backend,
@@ -289,10 +318,10 @@ fn reconnect(
         ..
     } = inputs;
     let Some(policy) = reconnect_policy else {
-        return Err(RunExit::Disconnected);
+        return Err(SessionExit::Disconnected);
     };
     metrics.set_connected(false);
-    let (info, new_backend) = reconnect_backend_with_retry(
+    let (info, mut new_backend) = reconnect_backend_with_retry(
         policy,
         state.last_reconnect_at,
         || control.is_stop_requested(),
@@ -302,16 +331,28 @@ fn reconnect(
                     "'{}' reconnected device has incompatible backend type",
                     policy.target.device_id
                 );
-                return Err(RunExit::IncompatibleDevice);
+                return Err(SessionExit::IncompatibleDevice);
             }
             validator(info, new_backend, control.pps())
         },
         || metrics.mark_loop_activity(),
     )?;
 
+    if control
+        .update_pps_bounds(new_backend.caps().pps_min, new_backend.caps().pps_max)
+        .is_err()
+    {
+        // The validator's PPS snapshot can become stale if a control handle
+        // changes PPS concurrently. Reject the new connection explicitly safe.
+        new_backend.close_and_disconnect();
+        return Err(SessionExit::IncompatibleDevice);
+    }
     *backend = new_backend;
-    state.shutter_open = false;
-    state.last_armed = false;
+    state.shutter_state = ShutterState::Closed;
+    // Reconnect starts a fresh confirmed-disarmed hardware lifecycle. Preserve
+    // generation zero as the handled baseline so an already-requested arm must
+    // still run full rising preparation.
+    state.handled_state = crate::session::DesiredState::initial();
     state.last_reconnect_at = Some(Instant::now());
     metrics.set_connected(true);
 
@@ -343,33 +384,87 @@ fn reconnect(
 
 /// Handle arm/disarm shutter transitions, mutating source-side state via the
 /// `ContentSource` lifecycle methods.
-fn handle_shutter_transition(
-    is_armed: bool,
-    last_armed: &mut bool,
-    shutter_open: &mut bool,
-    backend: &mut BackendKind,
-    source: &mut SourceOwned,
-    pps: u32,
-) {
-    if !*last_armed && is_armed {
-        source.arm_startup_blank(pps);
-        source.reset_output_filter(OutputResetReason::Arm);
-        if !*shutter_open {
-            let _ = backend.set_shutter(true);
-            *shutter_open = true;
-        }
-    } else if *last_armed && !is_armed {
-        source.on_disarm();
-        source.reset_output_filter(OutputResetReason::Disarm);
-        if *shutter_open {
-            let _ = backend.set_shutter(false);
-            *shutter_open = false;
-        }
-    }
-    *last_armed = is_armed;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransitionOutcome {
+    Continue,
+    Disconnected,
 }
 
-/// Close the shutter (best-effort) and return [`RunExit::Stopped`].
+fn command_close(backend: &mut BackendKind, shutter_state: &mut ShutterState, force: bool) {
+    if force || *shutter_state != ShutterState::Closed {
+        *shutter_state = match backend.set_shutter(false) {
+            Ok(()) => ShutterState::Closed,
+            Err(_) => ShutterState::Unknown,
+        };
+    }
+}
+
+fn handle_shutter_transition(
+    control: &SessionControl,
+    handled_state: &mut crate::session::DesiredState,
+    shutter_state: &mut ShutterState,
+    backend: &mut BackendKind,
+    source: &mut SourceOwned,
+    adapter: &mut dyn OutputModelAdapter,
+    pps: u32,
+) -> TransitionOutcome {
+    let desired = control.desired_state();
+    if desired != *handled_state {
+        // Any generation change ending disarmed, or any change from an armed
+        // lifecycle, requires falling cleanup. This catches arm->disarm and
+        // disarm->arm pairs that occur entirely between scheduler passes.
+        if handled_state.is_armed() || !desired.is_armed() {
+            command_close(backend, shutter_state, false);
+            source.discard_cached();
+            adapter.on_state_change(false);
+            source.on_disarm();
+            source.reset_output_filter(OutputResetReason::Disarm);
+            *handled_state = desired;
+
+            // A concurrent edge during falling cleanup must be handled by a
+            // fresh pass; never reconcile it directly into an open command.
+            if control.desired_state() != desired {
+                return TransitionOutcome::Continue;
+            }
+        }
+
+        if desired.is_armed() {
+            source.discard_cached();
+            adapter.on_state_change(true);
+            source.arm_startup_blank(pps);
+            source.reset_output_filter(OutputResetReason::Arm);
+            if let Err(e) = backend.reset_device_buffer() {
+                log::error!("reset_device_buffer on arm failed; disconnecting safely: {e}");
+                command_close(backend, shutter_state, true);
+                let _ = backend.disconnect();
+                return TransitionOutcome::Disconnected;
+            }
+            *handled_state = desired;
+        }
+    }
+
+    // Opening is permitted only for the exact generation whose rising
+    // preparation completed. An error leaves hardware state unknown.
+    if desired.is_armed() && control.desired_state() == desired {
+        if *shutter_state != ShutterState::Open {
+            *shutter_state = match backend.set_shutter(true) {
+                Ok(()) => ShutterState::Open,
+                Err(_) => ShutterState::Unknown,
+            };
+        }
+        // Close a concurrent disarm even if the open command reported failure:
+        // failure cannot prove that hardware stayed closed.
+        if control.desired_state() != desired {
+            command_close(backend, shutter_state, true);
+        }
+    } else if !desired.is_armed() {
+        command_close(backend, shutter_state, false);
+    }
+
+    TransitionOutcome::Continue
+}
+
+/// Close the shutter (best-effort) and return [`SessionExit::Stopped`].
 ///
 /// A `Stop` request must never leave the shutter open — otherwise the beam
 /// freezes on the last bright point ("freeze on last bright point" hazard).
@@ -378,10 +473,542 @@ fn handle_shutter_transition(
 /// `is_stop_requested()` is checked before the control channel is drained, so a
 /// `Disarm` queued just before `Stop` could otherwise be dropped, leaving the
 /// shutter open.
-fn stop_and_close_shutter(backend: &mut BackendKind, shutter_open: &mut bool) -> RunExit {
-    if *shutter_open {
-        let _ = backend.set_shutter(false);
-        *shutter_open = false;
+fn stop_and_close_shutter(
+    backend: &mut BackendKind,
+    shutter_state: &mut ShutterState,
+) -> SessionExit {
+    // Stop always issues closure: cached state is not proof that connect or an
+    // earlier command did not enable output behind our back.
+    command_close(backend, shutter_state, true);
+    SessionExit::Stopped
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use std::collections::VecDeque;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use crate::backend::{BackendKind, DacBackend, FifoBackend, WriteOutcome};
+    use crate::buffer_estimate::{BufferEstimator, SoftwareDecayEstimator};
+    use crate::config::ReconnectConfig;
+    use crate::device::{DacCapabilities, DacInfo, DacType, EnabledDacTypes, OutputModel};
+    use crate::discovery::{DacDiscovery, DiscoveredDevice, DiscoveredDeviceInfo, Discoverer};
+    use crate::error::{Error, Result};
+    use crate::point::LaserPoint;
+    use crate::presentation::content_source::FifoContentSource;
+    use crate::presentation::output_model::{OutputModelAdapter, ShutterState, StepOutcome};
+    use crate::presentation::OutputResetReason;
+    use crate::reconnect::{ReconnectPolicy, ReconnectTarget};
+    use crate::session::{DesiredState, SessionControl, SessionExit};
+
+    use super::{
+        handle_shutter_transition, reconnect, stop_and_close_shutter, DriverInputs, LoopState,
+        SourceOwned,
+    };
+
+    struct LifecycleBackend {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        shutter_results: VecDeque<Result<()>>,
+        reset_results: VecDeque<Result<()>>,
+        estimator: SoftwareDecayEstimator,
+        caps: DacCapabilities,
     }
-    RunExit::Stopped
+
+    impl DacBackend for LifecycleBackend {
+        fn dac_type(&self) -> DacType {
+            DacType::Custom("lifecycle".into())
+        }
+        fn caps(&self) -> &DacCapabilities {
+            &self.caps
+        }
+        fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn set_shutter(&mut self, open: bool) -> Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(if open { "open" } else { "close" });
+            self.shutter_results.pop_front().unwrap_or(Ok(()))
+        }
+    }
+
+    impl FifoBackend for LifecycleBackend {
+        fn try_write_points(&mut self, _pps: u32, _points: &[LaserPoint]) -> Result<WriteOutcome> {
+            Ok(WriteOutcome::Written)
+        }
+        fn estimator(&self) -> &dyn BufferEstimator {
+            &self.estimator
+        }
+        fn reset_device_buffer(&mut self) -> Result<()> {
+            self.events.lock().unwrap().push("device-reset");
+            self.reset_results.pop_front().unwrap_or(Ok(()))
+        }
+    }
+
+    struct Source {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        arm_during_disarm: Option<SessionControl>,
+    }
+    impl FifoContentSource for Source {
+        fn produce_chunk(&mut self, _: usize, _: u32, _: bool) -> &[LaserPoint] {
+            &[]
+        }
+        fn cached_slice(&self) -> Option<&[LaserPoint]> {
+            None
+        }
+        fn commit_written(&mut self, _: usize, _: bool) {}
+        fn discard_cached(&mut self) {
+            self.events.lock().unwrap().push("discard");
+        }
+        fn reserve_buf(&mut self, _: usize) {}
+        fn on_reconnect(&mut self, _: &DacInfo) {}
+        fn is_ended(&self) -> bool {
+            false
+        }
+        fn arm_startup_blank(&mut self, _: u32) {
+            self.events.lock().unwrap().push("startup-blank");
+        }
+        fn on_disarm(&mut self) {
+            self.events.lock().unwrap().push("source-disarm");
+            if let Some(control) = self.arm_during_disarm.take() {
+                control.arm().unwrap();
+            }
+        }
+        fn reset_output_filter(&mut self, reason: OutputResetReason) {
+            self.events.lock().unwrap().push(match reason {
+                OutputResetReason::Arm => "filter-arm",
+                OutputResetReason::Disarm => "filter-disarm",
+                _ => "filter-other",
+            });
+        }
+    }
+
+    struct Adapter;
+    impl OutputModelAdapter for Adapter {
+        fn step(&mut self, _: &mut crate::presentation::output_model::LoopCtx<'_>) -> StepOutcome {
+            StepOutcome::Continue
+        }
+        fn on_reconnect(&mut self, _: &DacInfo, _: &mut BackendKind) {}
+    }
+
+    fn harness_with(
+        shutter_results: Vec<Result<()>>,
+        reset_results: Vec<Result<()>>,
+        arm_during_disarm: bool,
+    ) -> (
+        BackendKind,
+        SourceOwned,
+        SessionControl,
+        Arc<Mutex<Vec<&'static str>>>,
+    ) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let backend = LifecycleBackend {
+            events: Arc::clone(&events),
+            shutter_results: shutter_results.into(),
+            reset_results: reset_results.into(),
+            estimator: SoftwareDecayEstimator::new(),
+            caps: DacCapabilities {
+                pps_min: 1_000,
+                pps_max: 100_000,
+                max_points_per_chunk: 100,
+                output_model: OutputModel::NetworkFifo,
+            },
+        };
+        let (tx, rx) = mpsc::channel();
+        // The lifecycle unit harness invokes the handler directly rather than
+        // running a scheduler, so retain a live notification receiver.
+        std::mem::forget(rx);
+        let control =
+            SessionControl::new_with_pps_bounds(tx, Duration::ZERO, 30_000, 1_000, 100_000);
+        let source = SourceOwned::Fifo(Box::new(Source {
+            events: Arc::clone(&events),
+            arm_during_disarm: arm_during_disarm.then(|| control.clone()),
+        }));
+        (
+            BackendKind::Fifo(Box::new(backend)),
+            source,
+            control,
+            events,
+        )
+    }
+
+    fn harness(
+        results: Vec<Result<()>>,
+    ) -> (
+        BackendKind,
+        SourceOwned,
+        SessionControl,
+        Arc<Mutex<Vec<&'static str>>>,
+    ) {
+        harness_with(results, vec![], false)
+    }
+
+    struct ReconnectCleanupBackend {
+        connected: bool,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        estimator: SoftwareDecayEstimator,
+        caps: DacCapabilities,
+    }
+
+    impl DacBackend for ReconnectCleanupBackend {
+        fn dac_type(&self) -> DacType {
+            DacType::Custom("driver-reconnect-cleanup".into())
+        }
+        fn caps(&self) -> &DacCapabilities {
+            &self.caps
+        }
+        fn connect(&mut self) -> Result<()> {
+            self.connected = true;
+            Ok(())
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            self.connected = false;
+            self.events.lock().unwrap().push("disconnect");
+            Ok(())
+        }
+        fn is_connected(&self) -> bool {
+            self.connected
+        }
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn set_shutter(&mut self, open: bool) -> Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(if open { "open" } else { "close" });
+            Ok(())
+        }
+    }
+
+    impl FifoBackend for ReconnectCleanupBackend {
+        fn try_write_points(&mut self, _pps: u32, _points: &[LaserPoint]) -> Result<WriteOutcome> {
+            Ok(WriteOutcome::Written)
+        }
+        fn estimator(&self) -> &dyn BufferEstimator {
+            &self.estimator
+        }
+    }
+
+    struct ReconnectCleanupDiscoverer {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        caps: DacCapabilities,
+    }
+
+    impl Discoverer for ReconnectCleanupDiscoverer {
+        fn dac_type(&self) -> DacType {
+            DacType::Custom("driver-reconnect-cleanup".into())
+        }
+        fn prefix(&self) -> &str {
+            "driver-reconnect-cleanup"
+        }
+        fn scan(&mut self) -> Vec<DiscoveredDevice> {
+            vec![DiscoveredDevice::new(
+                DiscoveredDeviceInfo::new(
+                    self.dac_type(),
+                    "driver-reconnect-cleanup:1",
+                    "Driver reconnect cleanup",
+                ),
+                Box::new(()),
+            )
+            .with_caps(self.caps.clone())]
+        }
+        fn connect(&mut self, _opaque: Box<dyn std::any::Any + Send>) -> Result<BackendKind> {
+            Ok(BackendKind::Fifo(Box::new(ReconnectCleanupBackend {
+                connected: false,
+                events: self.events.clone(),
+                estimator: SoftwareDecayEstimator::new(),
+                caps: self.caps.clone(),
+            })))
+        }
+    }
+
+    #[test]
+    fn reconnect_pps_bounds_race_closes_and_disconnects_rejected_backend() {
+        let new_backend_events = Arc::new(Mutex::new(Vec::new()));
+        let factory_events = new_backend_events.clone();
+        let reconnect_caps = DacCapabilities {
+            pps_min: 1_000,
+            pps_max: 40_000,
+            max_points_per_chunk: 100,
+            output_model: OutputModel::NetworkFifo,
+        };
+        let factory_caps = reconnect_caps.clone();
+        let target = ReconnectTarget {
+            device_id: "driver-reconnect-cleanup:1".into(),
+            discovery_factory: Some(Box::new(move || {
+                let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
+                discovery.register(Box::new(ReconnectCleanupDiscoverer {
+                    events: factory_events.clone(),
+                    caps: factory_caps.clone(),
+                }));
+                discovery
+            })),
+        };
+        let policy = ReconnectPolicy::new(ReconnectConfig::new().max_retries(1), target);
+
+        let (backend, source, control, _) = harness(vec![]);
+        let validator_control = control.clone();
+        let validator: super::ReconnectValidator =
+            Box::new(move |_info: &DacInfo, backend: &BackendKind, pps: u32| {
+                assert_eq!(pps, 30_000);
+                if backend.is_connected() {
+                    validator_control.set_pps(50_000).unwrap();
+                }
+                Ok(())
+            });
+        let metrics = crate::presentation::FrameSessionMetrics::new(true);
+        let (_control_tx, control_rx) = mpsc::channel();
+        let mut inputs = DriverInputs {
+            backend,
+            source,
+            control,
+            control_rx,
+            metrics,
+            reconnect_policy: Some(policy),
+            validator,
+            error_sink: Box::new(|_| {}),
+            target_buffer: Duration::ZERO,
+            drain_timeout: Duration::ZERO,
+            pending_frame: None,
+            clock: DriverInputs::system_clock(),
+        };
+        let mut adapter = Adapter;
+        let mut state = LoopState::default();
+
+        let result = reconnect(&mut inputs, &mut adapter, &mut state);
+
+        assert_eq!(result, Err(SessionExit::IncompatibleDevice));
+        assert_eq!(inputs.control.pps(), 50_000);
+        assert_eq!(
+            *new_backend_events.lock().unwrap(),
+            vec!["close", "close", "disconnect"]
+        );
+    }
+
+    #[test]
+    fn startup_preparation_precedes_open_and_open_failure_is_retried() {
+        let (mut backend, mut source, control, events) =
+            harness(vec![Err(Error::invalid_config("first open fails")), Ok(())]);
+        let mut adapter = Adapter;
+        let mut handled = DesiredState::initial();
+        let mut shutter = ShutterState::Closed;
+        control.arm().unwrap();
+
+        handle_shutter_transition(
+            &control,
+            &mut handled,
+            &mut shutter,
+            &mut backend,
+            &mut source,
+            &mut adapter,
+            30_000,
+        );
+        assert_eq!(shutter, ShutterState::Unknown);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "discard",
+                "startup-blank",
+                "filter-arm",
+                "device-reset",
+                "open"
+            ]
+        );
+
+        handle_shutter_transition(
+            &control,
+            &mut handled,
+            &mut shutter,
+            &mut backend,
+            &mut source,
+            &mut adapter,
+            30_000,
+        );
+        assert_eq!(shutter, ShutterState::Open);
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| **e == "open")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn rapid_disarm_arm_final_armed_runs_falling_then_rising_before_open() {
+        let (mut backend, mut source, control, events) = harness(vec![]);
+        let mut adapter = Adapter;
+        let mut handled = DesiredState::initial();
+        let mut shutter = ShutterState::Closed;
+
+        control.arm().unwrap();
+        handle_shutter_transition(
+            &control,
+            &mut handled,
+            &mut shutter,
+            &mut backend,
+            &mut source,
+            &mut adapter,
+            30_000,
+        );
+        events.lock().unwrap().clear();
+
+        control.disarm().unwrap();
+        control.arm().unwrap();
+        handle_shutter_transition(
+            &control,
+            &mut handled,
+            &mut shutter,
+            &mut backend,
+            &mut source,
+            &mut adapter,
+            30_000,
+        );
+
+        assert_eq!(shutter, ShutterState::Open);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "close",
+                "discard",
+                "source-disarm",
+                "filter-disarm",
+                "discard",
+                "startup-blank",
+                "filter-arm",
+                "device-reset",
+                "open"
+            ]
+        );
+    }
+
+    #[test]
+    fn arm_arriving_mid_falling_handler_defers_open_until_next_prepared_pass() {
+        let (mut backend, mut source, control, events) = harness_with(vec![], vec![], true);
+        let mut adapter = Adapter;
+        let mut shutter = ShutterState::Open;
+
+        control.arm().unwrap();
+        let mut handled = control.desired_state();
+        control.disarm().unwrap();
+        handle_shutter_transition(
+            &control,
+            &mut handled,
+            &mut shutter,
+            &mut backend,
+            &mut source,
+            &mut adapter,
+            30_000,
+        );
+        assert_eq!(shutter, ShutterState::Closed);
+        assert!(!events.lock().unwrap().contains(&"open"));
+
+        events.lock().unwrap().clear();
+        handle_shutter_transition(
+            &control,
+            &mut handled,
+            &mut shutter,
+            &mut backend,
+            &mut source,
+            &mut adapter,
+            30_000,
+        );
+        assert_eq!(shutter, ShutterState::Open);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "discard",
+                "startup-blank",
+                "filter-arm",
+                "device-reset",
+                "open"
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_open_is_closed_on_disarm_and_stop_always_commands_close() {
+        let (mut backend, mut source, control, events) = harness(vec![
+            Err(Error::backend(std::io::Error::other("open uncertain"))),
+            Ok(()),
+            Ok(()),
+        ]);
+        let mut adapter = Adapter;
+        let mut handled = DesiredState::initial();
+        let mut shutter = ShutterState::Closed;
+
+        control.arm().unwrap();
+        handle_shutter_transition(
+            &control,
+            &mut handled,
+            &mut shutter,
+            &mut backend,
+            &mut source,
+            &mut adapter,
+            30_000,
+        );
+        assert_eq!(shutter, ShutterState::Unknown);
+        control.disarm().unwrap();
+        handle_shutter_transition(
+            &control,
+            &mut handled,
+            &mut shutter,
+            &mut backend,
+            &mut source,
+            &mut adapter,
+            30_000,
+        );
+        assert_eq!(shutter, ShutterState::Closed);
+        stop_and_close_shutter(&mut backend, &mut shutter);
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| **e == "close")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn reset_device_buffer_failure_prevents_open() {
+        let (mut backend, mut source, control, events) = harness_with(
+            vec![Ok(())],
+            vec![Err(Error::backend(std::io::Error::other("reset failed")))],
+            false,
+        );
+        let mut adapter = Adapter;
+        let mut handled = DesiredState::initial();
+        let mut shutter = ShutterState::Closed;
+        control.arm().unwrap();
+
+        let outcome = handle_shutter_transition(
+            &control,
+            &mut handled,
+            &mut shutter,
+            &mut backend,
+            &mut source,
+            &mut adapter,
+            30_000,
+        );
+        assert_eq!(outcome, super::TransitionOutcome::Disconnected);
+        assert!(!events.lock().unwrap().contains(&"open"));
+        assert_eq!(shutter, ShutterState::Closed);
+    }
 }

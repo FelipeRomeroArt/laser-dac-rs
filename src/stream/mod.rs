@@ -1,7 +1,7 @@
 //! Stream and Dac types for point output.
 //!
 //! This module provides the `Stream` type for streaming point chunks to a DAC,
-//! `StreamControl` for out-of-band control (arm/disarm/stop), and `Dac` for
+//! `SessionControl` for out-of-band control (arm/disarm/stop), and `Dac` for
 //! connected devices that can start streaming sessions.
 //!
 //! # Armed/Disarmed Model
@@ -25,18 +25,17 @@
 //! # Disconnect Behavior
 //!
 //! By default, streams do not reconnect — on disconnect, `run()` returns
-//! `RunExit::Disconnected`. When reconnection is enabled but a replacement
-//! device fails validation, `run()` returns `RunExit::IncompatibleDevice`
+//! `SessionExit::Disconnected`. When reconnection is enabled but a replacement
+//! device fails validation, `run()` returns `SessionExit::IncompatibleDevice`
 //! instead (a deterministic mismatch that retrying cannot fix). Configure
 //! reconnection via
 //! [`StreamConfig::with_reconnect`](crate::StreamConfig::with_reconnect) or
 //! [`FrameSessionConfig::with_reconnect`](crate::FrameSessionConfig::with_reconnect).
 //! New streams always start disarmed for safety.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 
 use crate::backend::{BackendKind, Error, Result};
 use crate::config::StreamConfig;
@@ -44,6 +43,7 @@ use crate::device::{DacCapabilities, DacInfo, DacType};
 use crate::discovery::DacDiscovery;
 use crate::point::LaserPoint;
 use crate::reconnect::{ReconnectPolicy, ReconnectTarget};
+use crate::session::{ControlMsg, SessionControl, SessionExit};
 
 pub(crate) mod chunk_producer;
 
@@ -154,7 +154,7 @@ pub struct ChunkRequest {
     /// Use this for audio synchronization.
     pub start: StreamInstant,
 
-    /// Points per second (current value, may change via `StreamControl::set_pps`).
+    /// Points per second (current value, may change via `SessionControl::set_pps`).
     pub pps: u32,
 
     /// Ideal number of points to reach target buffer level.
@@ -192,7 +192,7 @@ pub enum ChunkResult {
     /// 1. Stop calling callback
     /// 2. Let queued points drain (play out)
     /// 3. Blank/park the laser at last position
-    /// 4. Return from stream() with `RunExit::ProducerEnded`
+    /// 4. Return from stream() with `SessionExit::ProducerEnded`
     End,
 }
 
@@ -250,166 +250,6 @@ impl SharedStreamStats {
     }
 }
 
-/// How a callback-mode stream run ended.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RunExit {
-    /// Stream was stopped via `StreamControl::stop()`.
-    Stopped,
-    /// Producer returned `None` (graceful completion).
-    ProducerEnded,
-    /// Device disconnected. No auto-reconnect; new streams start disarmed.
-    Disconnected,
-    /// Reconnected device was rejected during validation: incompatible
-    /// backend type, output model, or PPS range. Retrying cannot fix this —
-    /// the replacement device fundamentally doesn't match what the session
-    /// was configured for.
-    IncompatibleDevice,
-}
-
-// =============================================================================
-// Stream Control
-// =============================================================================
-
-/// Control messages sent from StreamControl to Stream.
-///
-/// These messages allow out-of-band control actions to take effect immediately,
-/// even when the stream is waiting (pacing, backpressure, etc.).
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum ControlMsg {
-    /// Arm the output (opens hardware shutter).
-    Arm,
-    /// Disarm the output (closes hardware shutter).
-    Disarm,
-    /// Request the stream to stop.
-    Stop,
-}
-
-/// Thread-safe control handle for safety-critical actions.
-///
-/// This allows out-of-band control of the stream (arm/disarm/stop) from
-/// a different thread, e.g., for E-stop functionality.
-///
-/// Control actions take effect as soon as possible - the stream processes
-/// control messages at every opportunity (during waits, between retries, etc.).
-#[derive(Clone)]
-pub struct StreamControl {
-    inner: Arc<StreamControlInner>,
-}
-
-struct StreamControlInner {
-    /// Whether output is armed (laser can fire).
-    armed: AtomicBool,
-    /// Whether a stop has been requested.
-    stop_requested: AtomicBool,
-    /// Channel for sending control messages to the stream loop.
-    /// Wrapped in Mutex because Sender is Send but not Sync.
-    control_tx: Mutex<Sender<ControlMsg>>,
-    /// Color delay in microseconds (readable per-chunk without locking).
-    color_delay_micros: AtomicU64,
-    /// Points per second (hot-swappable without session restart).
-    pps: AtomicU32,
-}
-
-impl StreamControl {
-    pub(crate) fn new(control_tx: Sender<ControlMsg>, color_delay: Duration, pps: u32) -> Self {
-        Self {
-            inner: Arc::new(StreamControlInner {
-                armed: AtomicBool::new(false),
-                stop_requested: AtomicBool::new(false),
-                control_tx: Mutex::new(control_tx),
-                color_delay_micros: AtomicU64::new(color_delay.as_micros() as u64),
-                pps: AtomicU32::new(pps),
-            }),
-        }
-    }
-
-    /// Arm the output (allow laser to fire).
-    ///
-    /// When armed, content from the producer passes through unmodified
-    /// and the hardware shutter is opened (best-effort).
-    pub fn arm(&self) -> Result<()> {
-        self.inner.armed.store(true, Ordering::SeqCst);
-        // Send message to stream for immediate shutter control
-        if let Ok(tx) = self.inner.control_tx.lock() {
-            let _ = tx.send(ControlMsg::Arm);
-        }
-        Ok(())
-    }
-
-    /// Disarm the output (force laser off). Designed for E-stop use.
-    ///
-    /// Immediately sets an atomic flag (works even if stream loop is blocked),
-    /// then sends a message to close the hardware shutter. All future points
-    /// are blanked in software. The stream stays alive outputting blanks -
-    /// use `stop()` to terminate entirely.
-    ///
-    /// **Latency**: Points already in the device buffer will still play out.
-    /// `target_buffer` bounds this latency.
-    ///
-    /// **Hardware shutter**: Best-effort. LaserCube and Helios have actual hardware
-    /// control; Ether Dream, IDN are no-ops (safety relies on software blanking).
-    pub fn disarm(&self) -> Result<()> {
-        self.inner.armed.store(false, Ordering::SeqCst);
-        // Send message to stream for immediate shutter control
-        if let Ok(tx) = self.inner.control_tx.lock() {
-            let _ = tx.send(ControlMsg::Disarm);
-        }
-        Ok(())
-    }
-
-    /// Check if the output is armed.
-    pub fn is_armed(&self) -> bool {
-        self.inner.armed.load(Ordering::SeqCst)
-    }
-
-    /// Set the color delay for scanner sync compensation.
-    ///
-    /// Takes effect within one chunk period. The delay is quantized to
-    /// whole points: `ceil(delay * pps)`.
-    pub fn set_color_delay(&self, delay: Duration) {
-        self.inner
-            .color_delay_micros
-            .store(delay.as_micros() as u64, Ordering::SeqCst);
-    }
-
-    /// Get the current color delay.
-    pub fn color_delay(&self) -> Duration {
-        Duration::from_micros(self.inner.color_delay_micros.load(Ordering::SeqCst))
-    }
-
-    /// Set the points per second rate.
-    ///
-    /// Takes effect within one chunk period — the stream loop reads this
-    /// atomically each iteration and recalculates timing on the fly.
-    /// No session restart required.
-    pub fn set_pps(&self, pps: u32) {
-        self.inner.pps.store(pps, Ordering::SeqCst);
-    }
-
-    /// Get the current points per second rate.
-    pub fn pps(&self) -> u32 {
-        self.inner.pps.load(Ordering::SeqCst)
-    }
-
-    /// Request the stream to stop.
-    ///
-    /// Signals termination; `run()` returns `RunExit::Stopped`.
-    /// For clean shutdown with shutter close, prefer `Stream::stop()`.
-    pub fn stop(&self) -> Result<()> {
-        self.inner.stop_requested.store(true, Ordering::SeqCst);
-        // Send message to stream for immediate stop
-        if let Ok(tx) = self.inner.control_tx.lock() {
-            let _ = tx.send(ControlMsg::Stop);
-        }
-        Ok(())
-    }
-
-    /// Check if a stop has been requested.
-    pub fn is_stop_requested(&self) -> bool {
-        self.inner.stop_requested.load(Ordering::SeqCst)
-    }
-}
-
 // =============================================================================
 // Stream State
 // =============================================================================
@@ -450,8 +290,8 @@ pub struct Stream {
     /// Stream configuration.
     config: StreamConfig,
     /// Thread-safe control handle.
-    control: StreamControl,
-    /// Receiver for control messages from StreamControl.
+    control: SessionControl,
+    /// Receiver for control messages from SessionControl.
     control_rx: Receiver<ControlMsg>,
     /// Stream state.
     state: StreamState,
@@ -465,13 +305,21 @@ impl Stream {
     /// Create a new stream with a backend.
     pub(crate) fn with_backend(info: DacInfo, backend: BackendKind, config: StreamConfig) -> Self {
         let (control_tx, control_rx) = mpsc::channel();
-        let color_delay = config.color_delay;
-        let pps = config.pps;
+        let color_delay = config.color_delay();
+        let pps = config.pps();
+        let pps_min = info.caps.pps_min;
+        let pps_max = info.caps.pps_max;
         Self {
             info,
             backend: Some(backend),
             config,
-            control: StreamControl::new(control_tx, color_delay, pps),
+            control: SessionControl::new_with_pps_bounds(
+                control_tx,
+                color_delay,
+                pps,
+                pps_min,
+                pps_max,
+            ),
             control_rx,
             state: StreamState::new(),
             reconnect_policy: None,
@@ -490,7 +338,7 @@ impl Stream {
     }
 
     /// Returns a thread-safe control handle.
-    pub fn control(&self) -> StreamControl {
+    pub fn control(&self) -> SessionControl {
         self.control.clone()
     }
 
@@ -594,11 +442,11 @@ impl Stream {
     ///
     /// # Exit Conditions
     ///
-    /// - **`RunExit::Stopped`**: Stop requested via `StreamControl::stop()`.
-    /// - **`RunExit::ProducerEnded`**: Callback returned `ChunkResult::End`.
-    /// - **`RunExit::Disconnected`**: Device disconnected.
-    /// - **`RunExit::IncompatibleDevice`**: A reconnected device failed
-    ///   validation (backend type, output model, or PPS range mismatch).
+    /// - **`SessionExit::Stopped`**: Stop requested via `SessionControl::stop()`.
+    /// - **`SessionExit::ProducerEnded`**: Callback returned `ChunkResult::End`.
+    /// - **`SessionExit::Disconnected`**: Device disconnected.
+    /// - **`SessionExit::IncompatibleDevice`**: A replacement device failed
+    ///   validation (backend kind, output model, or PPS range mismatch).
     ///
     /// # Example
     ///
@@ -618,7 +466,7 @@ impl Stream {
     ///     |err| eprintln!("Error: {}", err),
     /// )?;
     /// ```
-    pub fn run<F, E>(mut self, producer: F, on_error: E) -> Result<RunExit>
+    pub fn run<F, E>(mut self, producer: F, on_error: E) -> Result<SessionExit>
     where
         F: FnMut(&ChunkRequest, &mut [LaserPoint]) -> ChunkResult + Send + 'static,
         E: FnMut(Error) + Send + 'static,
@@ -626,11 +474,12 @@ impl Stream {
         use crate::presentation::driver::{self, DriverInputs, SourceOwned};
         use crate::presentation::FrameSessionMetrics;
 
-        let backend = self
+        let mut backend = self
             .backend
             .take()
             .ok_or_else(|| Error::disconnected("backend already consumed"))?;
         if backend.is_frame_swap() {
+            backend.close_and_disconnect();
             return Err(Error::invalid_config(
                 "Stream::run is FIFO-only; use start_frame_session for frame-swap DACs",
             ));
@@ -640,8 +489,8 @@ impl Stream {
         let chunk_producer = chunk_producer::ChunkProducer::new(
             producer,
             self.control.clone(),
-            self.config.idle_policy.clone(),
-            self.config.startup_blank,
+            self.config.idle_policy().clone(),
+            self.config.startup_blank(),
             max_points,
             self.state.stats.clone(),
         );
@@ -662,8 +511,8 @@ impl Stream {
             reconnect_policy: self.reconnect_policy.take(),
             validator,
             error_sink: Box::new(on_error),
-            target_buffer: self.config.target_buffer,
-            drain_timeout: self.config.drain_timeout,
+            target_buffer: self.config.target_buffer(),
+            drain_timeout: self.config.drain_timeout(),
             pending_frame: None,
             clock: DriverInputs::system_clock(),
         })
@@ -683,7 +532,7 @@ impl Stream {
             move |_info: &DacInfo, new_backend: &BackendKind, pps: u32| {
                 if new_backend.is_frame_swap() {
                     log::error!("reconnected device is frame-swap, incompatible with streaming");
-                    return Err(RunExit::IncompatibleDevice);
+                    return Err(SessionExit::IncompatibleDevice);
                 }
                 if new_backend.caps().output_model != expected_output_model {
                     log::error!(
@@ -692,11 +541,11 @@ impl Stream {
                         new_backend.caps().output_model,
                         expected_output_model
                     );
-                    return Err(RunExit::IncompatibleDevice);
+                    return Err(SessionExit::IncompatibleDevice);
                 }
                 if Dac::validate_pps(new_backend.caps(), pps).is_err() {
                     log::error!("reconnected device PPS range incompatible with stream config");
-                    return Err(RunExit::IncompatibleDevice);
+                    return Err(SessionExit::IncompatibleDevice);
                 }
                 Ok(())
             },
@@ -710,7 +559,7 @@ impl Stream {
     /// runtime-authority, or pure software) and updates it from inside its
     /// own protocol code. The scheduler trusts that single source of truth.
     fn estimate_buffer_points(&self) -> u64 {
-        let pps = self.config.pps;
+        let pps = self.config.pps();
         let now = std::time::Instant::now();
         self.backend
             .as_ref()
@@ -876,26 +725,43 @@ impl Dac {
     /// - The backend fails to connect.
     pub fn start_stream(mut self, mut cfg: StreamConfig) -> Result<(Stream, DacInfo)> {
         // Extract reconnect config before consuming cfg
-        let reconnect_config = cfg.reconnect.take();
+        let reconnect_config = cfg.take_reconnect();
 
         let mut backend = self.backend.take().ok_or_else(|| {
             Error::invalid_config("device backend has already been used for a stream")
         })?;
 
+        if let Err(err) = backend.validate_output_model() {
+            backend.close_and_disconnect();
+            return Err(err);
+        }
         if backend.is_frame_swap() {
+            backend.close_and_disconnect();
             return Err(Error::invalid_config(
                 "streaming is not supported on frame-swap DACs (e.g. Helios); \
                  use start_frame_session() instead",
             ));
         }
 
-        let cfg = Self::apply_backend_buffer_defaults(&self.info, cfg);
-
-        Self::validate_pps(&self.info.caps, cfg.pps)?;
-
-        // Connect the backend if not already connected
+        // Connect can tighten live capabilities and can itself enable output on
+        // some hardware (LaserCube USB). Establish confirmed closure first,
+        // then validate and publish the connected capability snapshot.
         if !backend.is_connected() {
-            backend.connect()?;
+            if let Err(err) = backend.connect() {
+                backend.close_and_disconnect();
+                return Err(err);
+            }
+        }
+        if let Err(err) = backend.set_shutter(false) {
+            backend.close_and_disconnect();
+            return Err(err);
+        }
+        self.info.caps = backend.caps().clone();
+
+        let cfg = Self::apply_backend_buffer_defaults(&self.info, cfg);
+        if let Err(err) = Self::validate_pps(&self.info.caps, cfg.pps()) {
+            backend.close_and_disconnect();
+            return Err(err);
         }
 
         let mut stream = Stream::with_backend(self.info.clone(), backend, cfg);
@@ -905,9 +771,12 @@ impl Dac {
 
         // Wire reconnect policy if configured
         if let Some(rc) = reconnect_config {
-            let target = stream.reconnect_target.take().ok_or_else(|| {
-                Error::invalid_config("reconnect requires a reconnect target — use open_device(), open_device_with(), or Dac::with_discovery_factory()")
-            })?;
+            let Some(target) = stream.reconnect_target.take() else {
+                if let Some(mut backend) = stream.backend.take() {
+                    backend.close_and_disconnect();
+                }
+                return Err(Error::invalid_config("reconnect requires a reconnect target — use open_device(), open_device_with(), or Dac::with_discovery_factory()"));
+            };
             stream.reconnect_policy = Some(ReconnectPolicy::new(rc, target));
         }
 
@@ -915,9 +784,11 @@ impl Dac {
     }
 
     fn apply_backend_buffer_defaults(info: &DacInfo, mut cfg: StreamConfig) -> StreamConfig {
-        if cfg.target_buffer == StreamConfig::DEFAULT_TARGET_BUFFER {
-            cfg.target_buffer =
-                StreamConfig::default_target_buffer_for(&info.kind, &info.caps.output_model);
+        if cfg.target_buffer() == StreamConfig::DEFAULT_TARGET_BUFFER {
+            cfg.set_target_buffer(StreamConfig::default_target_buffer_for(
+                &info.kind,
+                &info.caps.output_model,
+            ));
         }
 
         cfg
@@ -946,19 +817,38 @@ impl Dac {
         mut self,
         mut config: crate::presentation::FrameSessionConfig,
     ) -> Result<(crate::presentation::FrameSession, DacInfo)> {
-        let reconnect_config = config.reconnect.take();
+        let reconnect_config = config.take_reconnect();
 
-        let backend = self.backend.take().ok_or_else(|| {
+        let mut backend = self.backend.take().ok_or_else(|| {
             Error::invalid_config("device backend has already been used for a session")
         })?;
 
-        Self::validate_pps(backend.caps(), config.pps)?;
+        if let Err(err) = backend.validate_output_model() {
+            backend.close_and_disconnect();
+            return Err(err);
+        }
+        if !backend.is_connected() {
+            if let Err(err) = backend.connect() {
+                backend.close_and_disconnect();
+                return Err(err);
+            }
+        }
+        if let Err(err) = backend.set_shutter(false) {
+            backend.close_and_disconnect();
+            return Err(err);
+        }
+        if let Err(err) = Self::validate_pps(backend.caps(), config.pps()) {
+            backend.close_and_disconnect();
+            return Err(err);
+        }
+        self.info.caps = backend.caps().clone();
 
         let reconnect_policy = match reconnect_config {
             Some(rc) => {
-                let target = self.reconnect_target.take().ok_or_else(|| {
-                    Error::invalid_config("reconnect requires a reconnect target — use open_device(), open_device_with(), or Dac::with_discovery_factory()")
-                })?;
+                let Some(target) = self.reconnect_target.take() else {
+                    backend.close_and_disconnect();
+                    return Err(Error::invalid_config("reconnect requires a reconnect target — use open_device(), open_device_with(), or Dac::with_discovery_factory()"));
+                };
                 Some(ReconnectPolicy::new(rc, target))
             }
             None => None,

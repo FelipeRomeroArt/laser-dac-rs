@@ -132,7 +132,7 @@ The callback returns a `TransitionPlan` describing what to do at each seam:
 use laser_dac::{FrameSessionConfig, LaserPoint, TransitionPlan};
 
 let config = FrameSessionConfig::new(30_000)
-    .with_transition_fn(Box::new(|from: &LaserPoint, to: &LaserPoint| {
+    .with_transition_fn(Box::new(|from: &LaserPoint, to: &LaserPoint, _context: &laser_dac::TransitionContext| {
         // Custom blanking: 4 linearly interpolated blank points
         TransitionPlan::Transition(
             (0..4).map(|i| {
@@ -333,6 +333,25 @@ Each backend handles conversion to its native format internally.
 | `LaserPoint`          | Single point with position (f32) and color (u16)        |
 | `DacType`             | Enum of supported DAC hardware                          |
 
+## Session API migration
+
+The session lifecycle API now uses neutral names for both content facades:
+
+- `StreamControl` → `SessionControl`
+- `RunExit` → `SessionExit`
+- `SessionControl::set_pps` now returns `Result<()>` and rejects rates outside
+  the active backend's capability range.
+- `default_transition()` no longer takes a startup PPS. Custom `TransitionFn`
+  callbacks receive `(from, to, &TransitionContext)` and should use
+  `context.pps` for runtime-rate-dependent seams.
+- `FrameSessionConfig::with_color_delay_points` is replaced by
+  `with_color_delay(Duration)`; both frame and stream delay defaults are zero.
+- `StreamConfig` and `FrameSessionConfig` fields are private. Continue using
+  consuming `with_*` builders and use the read-only getters to inspect settings.
+
+`Stream` and `FrameSession` remain distinct content APIs; both run through the
+same internal lifecycle driver.
+
 ## Advanced Configuration
 
 ### Color Delay (Scanner Sync Compensation)
@@ -346,22 +365,23 @@ use std::time::Duration;
 
 // Frame mode: set via config
 let config = FrameSessionConfig::new(30_000)
-    .with_color_delay_points(5);
+    .with_color_delay(Duration::from_micros(100));
 
 // Streaming mode: set via config (applied at runtime)
 let config = StreamConfig::new(30_000)
     .with_color_delay(Duration::from_micros(100));
 ```
 
-Frame mode enables color delay by default (150us equivalent at the configured PPS).
-It is applied statefully to the emitted point stream:
+Both modes disable color delay by default (`Duration::ZERO`). Delays are stored
+as durations and quantized with the current runtime PPS only when fresh output
+is composed. They are applied statefully to the emitted point stream:
 
 - FIFO DACs carry delay across chunks
 - Frame-swap DACs carry delay across submitted frames
 - Transition points between frames are included in the delayed stream
 
-Streaming mode disables color delay by default. It can also be changed at runtime
-via `stream.control().set_color_delay(...)`.
+Color delay can also be changed at runtime via
+`session.control().set_color_delay(...)`.
 
 Typical values: 50-200us depending on scanner speed.
 
@@ -404,12 +424,16 @@ let config = StreamConfig::new(30_000)
 The point rate of a running stream can be changed without restarting:
 
 ```rust
-stream.control().set_pps(60_000); // takes effect within one chunk period
-let current = stream.control().pps();
+let control = stream.control();
+match control.set_pps(60_000) {
+    Ok(()) => println!("rate changed to {} PPS", control.pps()),
+    Err(err) => eprintln!("rate change rejected: {err}"),
+}
 ```
 
-The stream loop reads the rate atomically each iteration and recalculates timing
-on the fly. Each backend clamps or applies the rate according to its own limits.
+The new rate takes effect within one chunk period when it is inside the active
+backend's capability range. Out-of-range changes are rejected; they are not
+silently clamped.
 
 ## Features
 

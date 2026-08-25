@@ -32,17 +32,17 @@ use crate::device::{DacInfo, DacType, OutputModel};
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct StreamConfig {
     /// Points per second output rate.
-    pub pps: u32,
+    pps: u32,
 
     /// Target buffer level to maintain (default: 20ms).
     ///
     /// The callback's `target_points` is calculated to bring the buffer to this level.
     /// The callback is invoked when the buffer drops below this level.
     #[cfg_attr(feature = "serde", serde(with = "duration_millis"))]
-    pub target_buffer: std::time::Duration,
+    target_buffer: std::time::Duration,
 
     /// What to do when the stream is idle (underrun or disarmed).
-    pub idle_policy: IdlePolicy,
+    idle_policy: IdlePolicy,
 
     /// Maximum time to wait for queued points to drain on graceful shutdown (default: 1s).
     ///
@@ -50,7 +50,7 @@ pub struct StreamConfig {
     /// points to play out before returning. This timeout caps that wait to prevent
     /// blocking forever if the DAC stalls or queue depth is unknown.
     #[cfg_attr(feature = "serde", serde(with = "duration_millis"))]
-    pub drain_timeout: std::time::Duration,
+    drain_timeout: std::time::Duration,
 
     /// Initial color delay for scanner sync compensation (default: disabled).
     ///
@@ -58,12 +58,12 @@ pub struct StreamConfig {
     /// allowing galvo mirrors time to settle before the laser fires. The delay is
     /// implemented as a FIFO: output colors lag input colors by `ceil(color_delay * pps)` points.
     ///
-    /// Can be changed at runtime via [`crate::StreamControl::set_color_delay`].
+    /// Can be changed at runtime via [`crate::SessionControl::set_color_delay`].
     ///
     /// Typical values: 50–200µs depending on scanner speed.
     /// `Duration::ZERO` disables the delay (default).
     #[cfg_attr(feature = "serde", serde(with = "duration_micros"))]
-    pub color_delay: std::time::Duration,
+    color_delay: std::time::Duration,
 
     /// Duration of forced blanking after arming (default: 1ms).
     ///
@@ -78,14 +78,14 @@ pub struct StreamConfig {
     ///
     /// Set to `Duration::ZERO` to disable explicit startup blanking.
     #[cfg_attr(feature = "serde", serde(with = "duration_micros"))]
-    pub startup_blank: std::time::Duration,
+    startup_blank: std::time::Duration,
 
     /// Reconnection configuration (default: disabled).
     ///
     /// Set via [`with_reconnect`](Self::with_reconnect) to enable automatic
     /// reconnection when the device disconnects.
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub reconnect: Option<ReconnectConfig>,
+    reconnect: Option<ReconnectConfig>,
 }
 
 #[cfg(feature = "serde")]
@@ -186,6 +186,49 @@ impl StreamConfig {
             pps,
             ..Default::default()
         }
+    }
+
+    /// Points per second output rate.
+    pub fn pps(&self) -> u32 {
+        self.pps
+    }
+
+    /// Target buffer level to maintain.
+    pub fn target_buffer(&self) -> std::time::Duration {
+        self.target_buffer
+    }
+
+    /// Policy used while idle or disarmed.
+    pub fn idle_policy(&self) -> &IdlePolicy {
+        &self.idle_policy
+    }
+
+    /// Maximum graceful drain duration.
+    pub fn drain_timeout(&self) -> std::time::Duration {
+        self.drain_timeout
+    }
+
+    /// Configured color delay.
+    pub fn color_delay(&self) -> std::time::Duration {
+        self.color_delay
+    }
+
+    /// Configured startup blanking duration.
+    pub fn startup_blank(&self) -> std::time::Duration {
+        self.startup_blank
+    }
+
+    /// Reconnection configuration, when enabled.
+    pub fn reconnect(&self) -> Option<&ReconnectConfig> {
+        self.reconnect.as_ref()
+    }
+
+    pub(crate) fn take_reconnect(&mut self) -> Option<ReconnectConfig> {
+        self.reconnect.take()
+    }
+
+    pub(crate) fn set_target_buffer(&mut self, target_buffer: std::time::Duration) {
+        self.target_buffer = target_buffer;
     }
 
     /// Set the target buffer level to maintain (builder pattern).

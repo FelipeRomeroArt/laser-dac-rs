@@ -20,7 +20,7 @@ use laser_dac::receiver::{
 use laser_dac::types::{
     ChunkRequest, ChunkResult, DacType, EnabledDacTypes, LaserPoint, StreamConfig,
 };
-use laser_dac::{caps_for_dac_type, Dac, DacInfo, RunExit};
+use laser_dac::{caps_for_dac_type, Dac, DacInfo, SessionExit};
 
 /// Create an EnabledDacTypes with only IDN enabled.
 fn idn_only() -> EnabledDacTypes {
@@ -431,8 +431,8 @@ fn test_send_frame() {
     );
 }
 
-/// A runtime `set_pps` bypasses start-of-stream validation; the IDN backend
-/// must clamp the rate before it reaches the worker (and from there the wire).
+/// The IDN backend defensively clamps a rate supplied directly at its write
+/// boundary before it reaches the worker (and from there the wire).
 /// The wire carries the rate as chunk duration (points * 1e6 / scan_speed), so
 /// an unclamped u32::MAX would show up as a near-zero duration.
 #[test]
@@ -465,7 +465,7 @@ fn test_runtime_set_pps_is_clamped_to_device_maximum() {
 
     let control = stream.control();
     control.arm().unwrap();
-    control.set_pps(u32::MAX);
+    assert!(control.set_pps(u32::MAX).is_err());
 
     let chunks_sent = Arc::new(AtomicUsize::new(0));
     let chunks_sent_clone = chunks_sent.clone();
@@ -567,7 +567,7 @@ fn test_connection_loss_detection() {
     // the dead device as a disconnect.
     assert!(result.is_ok(), "Stream should complete without error");
     assert!(
-        matches!(result.unwrap(), RunExit::Disconnected),
+        matches!(result.unwrap(), SessionExit::Disconnected),
         "IDN liveness should detect the dead device and disconnect"
     );
 
@@ -631,8 +631,9 @@ fn test_full_lifecycle() {
     handle.simulate_disconnect();
     thread::sleep(Duration::from_millis(800));
 
-    // Stop the stream
-    control.stop().unwrap();
+    // The disconnect may already have ended the scheduler, in which case the
+    // desired stop is recorded but notification correctly reports failure.
+    let _ = control.stop();
     let _ = stream_thread
         .join()
         .expect("Stream thread should not panic");

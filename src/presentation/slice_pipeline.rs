@@ -14,13 +14,15 @@ use crate::point::LaserPoint;
 use super::content_source::{FifoContentSource, FrameContentSource};
 use super::engine::{ColorDelayLine, PresentationEngine};
 use super::{
-    blank_prefix, duration_micros_to_points, duration_to_points, park_point, Frame, OutputFilter,
-    OutputFilterContext, OutputResetReason, PresentedSliceKind,
+    blank_prefix, duration_to_points, park_point, Frame, OutputFilter, OutputFilterContext,
+    OutputResetReason, PresentedSliceKind,
 };
 
 pub(crate) struct SlicePipeline {
     engine: PresentationEngine,
     color_delay: ColorDelayLine,
+    /// Desired delay duration; quantized only when fresh output is produced.
+    color_delay_duration: Duration,
     output_filter: Option<Box<dyn OutputFilter>>,
     idle_policy: IdlePolicy,
     /// Working buffer. Reused across iterations; resized on demand.
@@ -42,14 +44,14 @@ impl SlicePipeline {
     #[cfg(test)]
     pub fn new(
         engine: PresentationEngine,
-        color_delay_points: usize,
+        color_delay: Duration,
         output_filter: Option<Box<dyn OutputFilter>>,
         idle_policy: IdlePolicy,
         initial_buf_capacity: usize,
     ) -> Self {
         Self::with_startup_blank(
             engine,
-            color_delay_points,
+            color_delay,
             output_filter,
             idle_policy,
             initial_buf_capacity,
@@ -59,7 +61,7 @@ impl SlicePipeline {
 
     pub fn with_startup_blank(
         mut engine: PresentationEngine,
-        color_delay_points: usize,
+        color_delay: Duration,
         output_filter: Option<Box<dyn OutputFilter>>,
         idle_policy: IdlePolicy,
         initial_buf_capacity: usize,
@@ -74,7 +76,8 @@ impl SlicePipeline {
         }
         Self {
             engine,
-            color_delay: ColorDelayLine::new(color_delay_points),
+            color_delay: ColorDelayLine::new(0),
+            color_delay_duration: color_delay,
             output_filter,
             idle_policy,
             buf: vec![LaserPoint::default(); initial_buf_capacity],
@@ -107,8 +110,8 @@ impl SlicePipeline {
         self.engine.set_frame_capacity(cap);
     }
 
-    pub fn resize_color_delay(&mut self, n: usize) {
-        self.color_delay.resize(n);
+    pub fn set_color_delay(&mut self, delay: Duration) {
+        self.color_delay_duration = delay;
     }
 
     pub fn reset_color_delay(&mut self) {
@@ -144,7 +147,7 @@ impl SlicePipeline {
         is_armed: bool,
     ) -> &[LaserPoint] {
         self.reserve_buf(target_points);
-        let n = self.engine.fill_chunk(&mut self.buf, target_points);
+        let n = self.engine.fill_chunk(&mut self.buf, target_points, pps);
         if n == 0 {
             self.invalidate();
             return &[];
@@ -161,6 +164,8 @@ impl SlicePipeline {
             &self.idle_policy,
         );
 
+        self.color_delay
+            .resize(duration_to_points(self.color_delay_duration, pps));
         self.color_delay.apply(&mut self.buf[..n]);
 
         if self.engine.has_logical_frame() {
@@ -185,7 +190,7 @@ impl SlicePipeline {
     /// Sets the cache.
     pub fn produce_frame_swap(&mut self, pps: u32, is_armed: bool) -> &[LaserPoint] {
         let n = {
-            let composed = self.engine.compose_hardware_frame();
+            let composed = self.engine.compose_hardware_frame(pps);
             if composed.is_empty() {
                 self.invalidate();
                 return &[];
@@ -207,6 +212,8 @@ impl SlicePipeline {
             &self.idle_policy,
         );
 
+        self.color_delay
+            .resize(duration_to_points(self.color_delay_duration, pps));
         self.color_delay.apply(&mut self.buf[..n]);
 
         if let Some(f) = self.output_filter.as_deref_mut() {
@@ -299,9 +306,12 @@ impl FifoContentSource for SlicePipeline {
         SlicePipeline::reset_output_filter(self, reason);
     }
 
-    fn resize_color_delay_micros(&mut self, micros: u64, pps: u32) {
-        let points = duration_micros_to_points(micros, pps);
-        self.resize_color_delay(points);
+    fn set_color_delay(&mut self, delay: Duration) {
+        SlicePipeline::set_color_delay(self, delay);
+    }
+
+    fn on_disarm(&mut self) {
+        self.reset_color_delay();
     }
 }
 
@@ -343,9 +353,12 @@ impl FrameContentSource for SlicePipeline {
         SlicePipeline::reset_output_filter(self, reason);
     }
 
-    fn resize_color_delay_micros(&mut self, micros: u64, pps: u32) {
-        let points = duration_micros_to_points(micros, pps);
-        self.resize_color_delay(points);
+    fn set_color_delay(&mut self, delay: Duration) {
+        SlicePipeline::set_color_delay(self, delay);
+    }
+
+    fn on_disarm(&mut self) {
+        self.reset_color_delay();
     }
 }
 
@@ -378,11 +391,39 @@ mod tests {
     }
 
     fn make_engine() -> PresentationEngine {
-        PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())))
+        PresentationEngine::new(Box::new(|_, _, _| TransitionPlan::Transition(Vec::new())))
     }
 
     fn make_pipeline(initial_cap: usize) -> SlicePipeline {
-        SlicePipeline::new(make_engine(), 0, None, IdlePolicy::Blank, initial_cap)
+        SlicePipeline::new(
+            make_engine(),
+            std::time::Duration::ZERO,
+            None,
+            IdlePolicy::Blank,
+            initial_cap,
+        )
+    }
+
+    #[test]
+    fn frame_delay_rescales_with_pps_and_carry_resets_on_disarm() {
+        let mut pipeline = SlicePipeline::new(
+            make_engine(),
+            Duration::from_millis(1),
+            None,
+            IdlePolicy::Blank,
+            0,
+        );
+        pipeline.set_pending(Frame::new(vec![lit_point(0.0), lit_point(1.0)]));
+
+        let first = pipeline.produce_fifo_chunk(2, 1_000, true).to_vec();
+        assert_eq!(pipeline.color_delay.delay(), 1);
+        assert_eq!(first[0].intensity, 0);
+        FifoContentSource::commit_written(&mut pipeline, 2, true);
+
+        FifoContentSource::on_disarm(&mut pipeline);
+        let second = pipeline.produce_fifo_chunk(2, 2_000, true).to_vec();
+        assert_eq!(pipeline.color_delay.delay(), 2);
+        assert!(second.iter().all(|point| point.intensity == 0));
     }
 
     #[test]
@@ -391,7 +432,7 @@ mod tests {
         // park position, not blank at the origin.
         let mut pipeline = SlicePipeline::new(
             make_engine(),
-            0,
+            std::time::Duration::ZERO,
             None,
             IdlePolicy::Park { x: 0.25, y: -0.5 },
             0,
@@ -413,7 +454,7 @@ mod tests {
         // point. Under `Park` that must be the configured position, not (0,0).
         let mut pipeline = SlicePipeline::new(
             make_engine(),
-            0,
+            std::time::Duration::ZERO,
             None,
             IdlePolicy::Park { x: 0.25, y: -0.5 },
             0,
@@ -513,7 +554,13 @@ mod tests {
         let filter = Box::new(RecordingFilter {
             resets: Arc::clone(&resets),
         });
-        let mut pipeline = SlicePipeline::new(make_engine(), 0, Some(filter), IdlePolicy::Blank, 0);
+        let mut pipeline = SlicePipeline::new(
+            make_engine(),
+            std::time::Duration::ZERO,
+            Some(filter),
+            IdlePolicy::Blank,
+            0,
+        );
         pipeline.reset_output_filter(OutputResetReason::SessionStart);
         pipeline.reset_output_filter(OutputResetReason::Reconnect);
         assert_eq!(

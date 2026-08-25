@@ -14,6 +14,7 @@
 mod common;
 
 use std::hint::black_box;
+use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use laser_dac::benchmark_support::{ChunkPipelineBenchmark, ChunkTarget, TransitionWorkload};
@@ -57,7 +58,7 @@ fn benchmark_fifo_chunk(c: &mut Criterion) {
         let mut fixture = ChunkPipelineBenchmark::new(
             frame.clone(),
             TransitionWorkload::Default { pps: PPS },
-            0,
+            Duration::ZERO,
             chunk_points,
             target,
         );
@@ -80,7 +81,7 @@ fn benchmark_fifo_chunk(c: &mut Criterion) {
     let mut fixture = ChunkPipelineBenchmark::new(
         frame,
         TransitionWorkload::Default { pps: PPS },
-        0,
+        Duration::ZERO,
         chunk_points,
         ChunkTarget::LaserCubeUsb,
     );
@@ -108,7 +109,7 @@ fn benchmark_frame_swap_chunk(c: &mut Criterion) {
     let mut fixture = ChunkPipelineBenchmark::new(
         frames[0].clone(),
         TransitionWorkload::Default { pps: PPS },
-        0,
+        Duration::ZERO,
         HELIOS_FRAME_CAPACITY,
         ChunkTarget::Helios,
     );

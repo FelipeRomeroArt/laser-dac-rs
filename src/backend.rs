@@ -299,6 +299,14 @@ impl BackendKind {
         }
     }
 
+    /// Best-effort safe teardown for an owned backend that cannot be returned
+    /// to its caller. Both commands are attempted even when connection state is
+    /// unknown or shutter closure fails.
+    pub(crate) fn close_and_disconnect(&mut self) {
+        let _ = self.set_shutter(false);
+        let _ = self.disconnect();
+    }
+
     // =========================================================================
     // Write dispatch
     // =========================================================================
