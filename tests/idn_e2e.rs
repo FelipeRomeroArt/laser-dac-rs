@@ -1129,7 +1129,10 @@ fn channel_message_packet(
     } else {
         0
     };
-    let total_size = 8 + config_size + 4 + samples.len();
+    // Sequels have no sample chunk header.
+    let is_sequel = chunk_type == 0xC0; // IDNVAL_CNKTYPE_LPGRF_FRAME_SEQUEL
+    let chunk_header_size = if is_sequel { 0 } else { 4 };
+    let total_size = 8 + config_size + chunk_header_size + samples.len();
     let content_id = 0x8000u16
         | if config_or_last_fragment {
             0x4000
@@ -1157,7 +1160,9 @@ fn channel_message_packet(
         }
     }
 
-    packet.extend_from_slice(&1000u32.to_be_bytes());
+    if !is_sequel {
+        packet.extend_from_slice(&1000u32.to_be_bytes());
+    }
     packet.extend_from_slice(samples);
     packet
 }
@@ -1230,7 +1235,7 @@ fn test_receiver_exposes_multi_packet_frame_chunk_metadata() {
     assert!(!chunks[1].has_config);
     assert!(chunks[1].is_last_fragment);
     assert_eq!(chunks[1].timestamp_us_u32, 2_000);
-    assert_eq!(chunks[1].duration_us, 1000);
+    assert_eq!(chunks[1].duration_us, 0);
     assert_eq!(chunks[1].point_count, 1);
 }
 
