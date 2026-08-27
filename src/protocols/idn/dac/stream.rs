@@ -416,9 +416,9 @@ impl Stream {
     ///   in one datagram) carries the sample chunk header with the **whole
     ///   frame** duration.
     /// * **Sequel** fragments (`FRAME_SEQUEL`) use the sequel layout — no
-    ///   sample chunk header, just continuation samples — and share the first
-    ///   fragment's message timestamp (the timestamp does not advance between
-    ///   fragments of one frame).
+    ///   sample chunk header, just continuation samples — and their message
+    ///   timestamp is the first fragment's plus the 0-based fragment number
+    ///   (IDN-Stream rev002, chunk types 0xC0..0xFF).
     /// * The **final** sequel sets `IDNFLG_CONTENTID_CONFIG_LSTFRG` (0x4000) to
     ///   mark the last fragment of the frame.
     fn write_frame_fragmented<P: Point>(&mut self, points: &[P]) -> Result<()> {
@@ -440,7 +440,8 @@ impl Stream {
             0
         };
 
-        // All fragments share one timestamp; the whole frame has one duration.
+        // The whole frame has one duration; each fragment's timestamp is
+        // ts_start plus its 0-based fragment number.
         let ts_start = self.current_timestamp_us();
         let total_points = points.len() as u64;
         let points_after = self.points_since_anchor + total_points;
@@ -474,7 +475,7 @@ impl Stream {
                 needs_config && is_first,
                 service_id,
                 channel_id,
-                ts_start,
+                ts_start + i as u64,
                 frame_duration_us,
                 now,
             )?;
@@ -1873,14 +1874,15 @@ mod tests {
         let sch: SampleChunkHeader = cursor.read_bytes().unwrap();
         assert_eq!(sch.duration_us(), 13_333);
 
-        // Fragment 1: a sequel — no sample chunk header, same timestamp.
+        // Fragment 1: a sequel — no sample chunk header, timestamp advances by
+        // the fragment number.
         let (n, _) = receiver.recv_from(&mut buf).unwrap();
         let (_, cmh1) = read_headers(&buf[..n]);
         assert_eq!(
             cmh1.content_id,
             chan | IDNVAL_CNKTYPE_LPGRF_FRAME_SEQUEL as u16
         );
-        assert_eq!(cmh1.timestamp, 1_000_000, "sequel shares frame timestamp");
+        assert_eq!(cmh1.timestamp, 1_000_001, "sequel carries ts + fragment number");
         // No LSTFRG on the middle sequel.
         assert_eq!(cmh1.content_id & IDNFLG_CONTENTID_CONFIG_LSTFRG, 0);
         // Sequel body starts immediately after the channel message header.
@@ -1889,14 +1891,14 @@ mod tests {
             ChannelMessageHeader::SIZE_BYTES + 133 * PointXyrgbi::SIZE_BYTES
         );
 
-        // Fragment 2: last sequel — LSTFRG set, same timestamp.
+        // Fragment 2: last sequel — LSTFRG set, timestamp advances again.
         let (n, _) = receiver.recv_from(&mut buf).unwrap();
         let (_, cmh2) = read_headers(&buf[..n]);
         assert_eq!(
             cmh2.content_id,
             chan | IDNVAL_CNKTYPE_LPGRF_FRAME_SEQUEL as u16 | IDNFLG_CONTENTID_CONFIG_LSTFRG
         );
-        assert_eq!(cmh2.timestamp, 1_000_000);
+        assert_eq!(cmh2.timestamp, 1_000_002);
     }
 
     #[test]
