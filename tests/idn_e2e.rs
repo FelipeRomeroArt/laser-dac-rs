@@ -1252,6 +1252,85 @@ fn test_receiver_exposes_multi_packet_frame_chunk_metadata() {
     assert_eq!(chunks[1].point_count, 1);
 }
 
+/// Consecutive multi-datagram frames sent with `write_frame` in Frame mode must
+/// all decode. Before the sequel-header fix, the receiver dropped its cached
+/// channel config at the first sequel, so every frame after it was lost.
+#[test]
+fn test_frame_mode_consecutive_multi_packet_frames_round_trip() {
+    use laser_dac::protocols::idn::stream::FrameMode;
+    use laser_dac::protocols::idn::PointXyrgbi;
+
+    const FRAMES: i16 = 3;
+    const POINTS: i16 = 400;
+
+    let handle = test_server("FrameSequelTest").unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let mut stream = connect_stream(&handle);
+    stream.set_frame_mode(FrameMode::Frame);
+    stream.set_scan_speed(30_000);
+
+    handle.clear_received_chunks();
+    for frame in 0..FRAMES {
+        let points: Vec<PointXyrgbi> = (0..POINTS)
+            .map(|i| PointXyrgbi::new(frame * 1000 + i, 0, 255, 0, 0, 255))
+            .collect();
+        stream.write_frame(&points).expect("Should write frame");
+    }
+
+    // 400 XYRGBI points need three datagrams per frame.
+    let chunks = wait_for_chunks(&handle, 9);
+
+    // Split the chunks into frames at each FrameFirst.
+    let mut frames: Vec<Vec<RecordedChunk>> = Vec::new();
+    for chunk in chunks {
+        if chunk.chunk_type == ChunkType::FrameFirst {
+            frames.push(Vec::new());
+        }
+        frames
+            .last_mut()
+            .expect("the first chunk must be a FrameFirst")
+            .push(chunk);
+    }
+    assert_eq!(frames.len(), FRAMES as usize, "every frame must decode");
+
+    for (frame, fragments) in (0..FRAMES).zip(&frames) {
+        assert!(
+            fragments.len() > 1,
+            "frame {frame} should span several datagrams"
+        );
+        let (first, sequels) = fragments.split_first().unwrap();
+
+        // Whole-frame duration: 400 points at 30 kpps, 13333 or 13334 us
+        // depending on where the timestamp accumulator rounds.
+        assert!(
+            (13_333..=13_334).contains(&first.duration_us),
+            "frame {frame}: FrameFirst duration {}",
+            first.duration_us
+        );
+        assert!(!first.is_last_fragment);
+
+        for (n, sequel) in sequels.iter().enumerate() {
+            assert_eq!(sequel.chunk_type, ChunkType::FrameSequel);
+            assert_eq!(sequel.duration_us, 0);
+            assert_eq!(
+                sequel.is_last_fragment,
+                n == sequels.len() - 1,
+                "frame {frame}: LSTFRG only on the last fragment"
+            );
+        }
+
+        let xs: Vec<i16> = fragments
+            .iter()
+            .flat_map(|c| c.xs.iter().copied())
+            .collect();
+        let expected: Vec<i16> = (0..POINTS).map(|i| frame * 1000 + i).collect();
+        assert_eq!(xs, expected, "frame {frame} must arrive in full, in order");
+    }
+
+    drop_stream_without_close(stream);
+}
+
 /// Our Frame-mode sender and our receiver must round-trip a frame that spans
 /// several datagrams through the ACKREQ path.
 #[test]
