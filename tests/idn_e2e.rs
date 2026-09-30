@@ -1378,6 +1378,61 @@ fn test_frame_mode_fragment_timestamps_advance_by_fragment_number() {
     drop_stream_without_close(stream);
 }
 
+/// Frame-mode sender → real receiver: each frame's sequel timestamps are the
+/// first fragment's plus the fragment number (IDN-Stream rev002), and the
+/// next frame starts later than the previous frame's last sequel.
+#[test]
+#[ignore = "needs the receiver sequel fix from PR #40 (fix-sequel-chunk-header); remove on merge"]
+fn test_receiver_sees_frame_mode_fragment_timestamps() {
+    use laser_dac::protocols::idn::dac::stream::FrameMode;
+    use laser_dac::protocols::idn::PointXyrgbi;
+
+    let handle = test_server("FragmentTimestampReceiverTest").unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let mut stream = connect_stream(&handle);
+    stream.set_frame_mode(FrameMode::Frame);
+
+    // 400 points need three datagrams per frame.
+    let points: Vec<PointXyrgbi> = (0..400)
+        .map(|i| PointXyrgbi::new(i as i16, 0, 255, 0, 0, 255))
+        .collect();
+
+    handle.clear_received_chunks();
+    stream.write_frame(&points).expect("Should write frame 1");
+    stream.write_frame(&points).expect("Should write frame 2");
+
+    let chunks = wait_for_chunks(&handle, 6);
+    assert_eq!(chunks.len(), 6, "expected three chunks per frame");
+
+    for frame in chunks.chunks(3) {
+        let types: Vec<ChunkType> = frame.iter().map(|c| c.chunk_type).collect();
+        assert_eq!(
+            types,
+            [
+                ChunkType::FrameFirst,
+                ChunkType::FrameSequel,
+                ChunkType::FrameSequel
+            ]
+        );
+        let last: Vec<bool> = frame.iter().map(|c| c.is_last_fragment).collect();
+        assert_eq!(last, [false, false, true]);
+        assert_eq!(frame.iter().map(|c| c.point_count).sum::<usize>(), 400);
+
+        let ts = frame[0].timestamp_us_u32;
+        let timestamps: Vec<u32> = frame.iter().map(|c| c.timestamp_us_u32).collect();
+        assert_eq!(timestamps, [ts, ts.wrapping_add(1), ts.wrapping_add(2)]);
+    }
+
+    // Frame 2 starts after frame 1's last sequel (modular u32 comparison).
+    let gap = chunks[3]
+        .timestamp_us_u32
+        .wrapping_sub(chunks[2].timestamp_us_u32) as i32;
+    assert!(gap > 0, "frame 2 must start after frame 1, gap {gap} us");
+
+    drop_stream_without_close(stream);
+}
+
 #[test]
 fn test_first_frame_has_nonzero_timestamp() {
     use laser_dac::protocols::idn::PointXyrgbi;
