@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use laser_dac::protocols::idn::protocol::IDNVAL_CNKTYPE_LPGRF_FRAME_SEQUEL;
 use laser_dac::receiver::{
     ChunkType, IdnServer, ReceivedChunk, Relay, ServerBehavior, ServerConfig, ServerHandle,
     Service, IDNCMD_RT_CNLMSG, IDNCMD_RT_CNLMSG_CLOSE_ACKREQ, IDNCMD_SERVICE_PARAMS_REQUEST,
@@ -70,6 +71,8 @@ pub struct RecordedChunk {
     pub timestamp_us_u32: u32,
     pub duration_us: u32,
     pub point_count: usize,
+    /// X of each point, scaled back to the i16 wire value.
+    pub xs: Vec<i16>,
 }
 
 impl RecordedChunk {
@@ -85,6 +88,11 @@ impl RecordedChunk {
             timestamp_us_u32: chunk.timestamp_us_u32,
             duration_us: chunk.duration_us,
             point_count: chunk.points.len(),
+            xs: chunk
+                .points
+                .iter()
+                .map(|p| (p.x * 32767.0).round() as i16)
+                .collect(),
         }
     }
 }
@@ -491,7 +499,12 @@ fn test_runtime_set_pps_is_clamped_to_device_maximum() {
         chunks.len() >= 3,
         "server should have received streamed chunks"
     );
-    for chunk in chunks.iter().filter(|c| c.point_count > 0) {
+    // Frame sequels carry no sample chunk header and report duration 0; the
+    // frame's duration is on its first fragment.
+    for chunk in chunks
+        .iter()
+        .filter(|c| c.point_count > 0 && c.chunk_type != ChunkType::FrameSequel)
+    {
         let effective_rate =
             (chunk.point_count as u64 * 1_000_000) / (chunk.duration_us.max(1) as u64);
         assert!(
@@ -1130,7 +1143,7 @@ fn channel_message_packet(
         0
     };
     // Sequels have no sample chunk header.
-    let is_sequel = chunk_type == 0xC0; // IDNVAL_CNKTYPE_LPGRF_FRAME_SEQUEL
+    let is_sequel = chunk_type == IDNVAL_CNKTYPE_LPGRF_FRAME_SEQUEL;
     let chunk_header_size = if is_sequel { 0 } else { 4 };
     let total_size = 8 + config_size + chunk_header_size + samples.len();
     let content_id = 0x8000u16
@@ -1201,7 +1214,7 @@ fn test_receiver_exposes_multi_packet_frame_chunk_metadata() {
     let last = channel_message_packet(
         12,
         3,
-        0xC0,
+        IDNVAL_CNKTYPE_LPGRF_FRAME_SEQUEL,
         true,
         false,
         2_000,
@@ -1237,6 +1250,65 @@ fn test_receiver_exposes_multi_packet_frame_chunk_metadata() {
     assert_eq!(chunks[1].timestamp_us_u32, 2_000);
     assert_eq!(chunks[1].duration_us, 0);
     assert_eq!(chunks[1].point_count, 1);
+}
+
+/// Our Frame-mode sender and our receiver must round-trip a frame that spans
+/// several datagrams through the ACKREQ path.
+#[test]
+fn test_frame_mode_ack_round_trips_multi_packet_frame() {
+    use laser_dac::protocols::idn::stream::FrameMode;
+    use laser_dac::protocols::idn::PointXyrgbi;
+
+    let handle = test_server("FrameAckTest").unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let mut stream = connect_stream(&handle);
+    stream.set_frame_mode(FrameMode::Frame);
+    stream.set_scan_speed(30_000);
+
+    // 400 XYRGBI points need three datagrams.
+    let points: Vec<PointXyrgbi> = (0..400)
+        .map(|i| PointXyrgbi::new(i as i16, -(i as i16), 255, 0, 0, 255))
+        .collect();
+
+    handle.clear_received_packets();
+    handle.clear_received_chunks();
+    stream
+        .write_frame_with_ack(&points, Duration::from_millis(500))
+        .expect("the frame should be acknowledged");
+
+    let chunks = wait_for_chunks(&handle, 3);
+    assert_eq!(chunks.len(), 3, "expected one chunk per datagram");
+
+    assert_eq!(chunks[0].chunk_type, ChunkType::FrameFirst);
+    assert!(chunks[0].has_config);
+    assert!(!chunks[0].is_last_fragment);
+    // Whole-frame duration: 400 points at 30 kpps.
+    assert_eq!(chunks[0].duration_us, 13_333);
+
+    assert_eq!(chunks[1].chunk_type, ChunkType::FrameSequel);
+    assert!(!chunks[1].is_last_fragment);
+    assert_eq!(chunks[1].duration_us, 0);
+
+    assert_eq!(chunks[2].chunk_type, ChunkType::FrameSequel);
+    assert!(chunks[2].is_last_fragment);
+    assert_eq!(chunks[2].duration_us, 0);
+
+    let xs: Vec<i16> = chunks.iter().flat_map(|c| c.xs.iter().copied()).collect();
+    let expected: Vec<i16> = (0..400).collect();
+    assert_eq!(xs, expected, "every point must arrive once, in order");
+
+    // Only the first fragment requests an acknowledgment.
+    let commands: Vec<u8> = handle
+        .received_packets
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|p| p[0])
+        .collect();
+    assert_eq!(commands, [0x41, 0x40, 0x40]);
+
+    drop_stream_without_close(stream);
 }
 
 #[test]
